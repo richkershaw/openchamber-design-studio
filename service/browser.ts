@@ -20,7 +20,8 @@ import type { SurfaceInputEvent, SurfaceModifiers } from '@openchamber/sdk';
 
 import { PROBE_EXPR, PROBE_SCRIPT } from '../shared/probe-script.ts';
 import type { ProbeReport } from '../shared/verify-types.ts';
-import { findChrome, type ChromeSource } from './chrome-path.ts';
+import { cdpSocketUrl, cdpVersionUrl, readBrowserSettings, type BrowserSettings } from './browser-settings.ts';
+import { isExecutableFile, resolveChromeExecutable, type ChromeSource } from './chrome-path.ts';
 import { startViewerServer } from './viewer-server.ts';
 import { ArtifactContexts } from './artifact-context.ts';
 import type { ShellAuthority, DefaultContext } from './artifact-context.ts';
@@ -136,6 +137,14 @@ export type PickedElement = {
   rect: { x: number; y: number; width: number; height: number };
 };
 
+/**
+ * How the live view got a browser: one we started ourselves, or one that was
+ * already running and we attached to over CDP.
+ */
+export type BrowserLauncher =
+  | { kind: 'spawn'; path: string; source: ChromeSource }
+  | { kind: 'attach'; endpoint: string };
+
 export type BrowserState = {
   url: string;
   title: string;
@@ -144,12 +153,11 @@ export type BrowserState = {
   /** True while the live Chrome window process is up; false once it has exited. */
   windowOpen: boolean;
   /**
-   * The executable the last launch resolved, and which resolution step found it
-   * (env, config, PATH, or a platform default). Null until a window has been
-   * launched; kept after the window closes, so "which Chrome was that?" stays
-   * answerable.
+   * The browser the last launch used: an executable we started and how it was
+   * found, or an endpoint we attached to. Null until a window has been launched;
+   * kept after it closes, so "which browser was that?" stays answerable.
    */
-  chrome: { path: string; source: ChromeSource } | null;
+  launcher: BrowserLauncher | null;
 };
 
 // ProbeElement / ProbeReport are single-sourced in shared/verify-types.ts; the
@@ -173,6 +181,19 @@ function emptyProbeReport(): ProbeReport {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * The most specific message a fetch failure carries. undici reports every
+ * failure as "fetch failed" and hangs the real cause — ECONNREFUSED, ENOTFOUND,
+ * a timeout — off `error.cause`, which is exactly what someone debugging a
+ * sidecar endpoint needs to read.
+ */
+function fetchFailureReason(error: unknown): string {
+  if (!(error instanceof Error)) return String(error);
+  const cause = (error as { cause?: unknown }).cause;
+  if (cause instanceof Error && cause.message) return `${error.message}: ${cause.message}`;
+  return error.message;
 }
 
 function openSocket(url: string): Promise<WebSocket> {
@@ -207,12 +228,19 @@ class CdpClient {
   private readonly handlers = new Map<string, Set<CdpHandler>>();
   private closed = false;
   private closeError: Error | null = null;
+  /** Notified once when the socket dies on its own; never on a deliberate close. */
+  private transportClosed: (() => void) | null = null;
 
   constructor(ws: WebSocket) {
     this.ws = ws;
     ws.addEventListener('message', (event) => this.onMessage(event));
     ws.addEventListener('close', () => this.onClose(new Error('CDP socket closed')));
     ws.addEventListener('error', () => this.onClose(new Error('CDP socket error')));
+  }
+
+  /** Called when the socket dies by itself — the browser went away. */
+  onTransportClose(handler: () => void): void {
+    this.transportClosed = handler;
   }
 
   private onMessage(event: MessageEvent): void {
@@ -252,6 +280,10 @@ class CdpClient {
       entry.reject(error);
     }
     this.pending.clear();
+    // A socket that dies by itself means the browser went away (crashed, was
+    // killed, or an attached sidecar was restarted). A deliberate close() sets
+    // `closed` first, so this never fires for our own teardown.
+    this.transportClosed?.();
   }
 
   send(method: string, params: Record<string, unknown> = {}, sessionId?: string): Promise<Record<string, unknown>> {
@@ -900,8 +932,10 @@ export class Browser {
   private debuggingPort: number | null = null;
   /** Set when the Chrome child exits on its own; drives `windowOpen`. */
   private closedAt: number | null = null;
-  /** The executable the last launch resolved and used; diagnostics only. */
-  private chromeInUse: { path: string; source: ChromeSource } | null = null;
+  /** How the last launch got its browser; diagnostics only. */
+  private launcher: BrowserLauncher | null = null;
+  /** The endpoint of the browser we attached to, while we are attached to it. */
+  private attachedEndpoint: string | null = null;
   /** True while an observed/intentional close is tearing Chrome down. */
   private quitting = false;
   /** The in-flight teardown, so a second close (or stop) joins it instead of racing. */
@@ -951,26 +985,74 @@ export class Browser {
     if (!isWebSafeUrl(this.requestedUrl)) {
       throw new Error('launch() needs a web-safe --app URL');
     }
-    // Resolve the browser BEFORE the viewer server starts: a machine with no
-    // Chrome must fail on the thing that is actually missing, rather than
+    const settings = readBrowserSettings();
+    if (settings.error) throw new Error(settings.error);
+    // The browser is settled BEFORE the viewer server starts: a machine with no
+    // browser must fail on the thing that is actually missing, rather than
     // leaving a half-started viewer behind a "no window" state.
-    const chromeBin = findChrome();
-    if (!chromeBin.ok) throw new Error(chromeBin.error);
+    const executable = settings.cdpEndpoint
+      ? null
+      : resolveChromeExecutable({
+          env: process.env,
+          platform: process.platform,
+          isExecutable: isExecutableFile,
+          configuredPath: settings.path,
+          configFile: settings.file,
+        });
+    if (executable && !executable.ok) throw new Error(executable.error);
+
     this.viewer = await startViewerServer({url:this.requestedUrl,pages:[],viewport:this.viewport()});
     const url = this.viewer.url;
     this.launchUrl = url;
+
+    const cdp = executable
+      ? await this.spawnBrowser(url, executable)
+      : await this.attachBrowser(settings, url);
+    this.cdp = cdp;
+    this.wireEvents(cdp);
+    // Target discovery makes Chrome report `Target.targetDestroyed` for the app
+    // window when the user closes it; without discovery a clean window close
+    // leaves the whole Chrome app running as a background process. Best effort:
+    // a browser that refuses it still works through detachedFromTarget/exit.
+    try {
+      await cdp.send('Target.setDiscoverTargets', { discover: true });
+    } catch {
+      /* older/newer Chrome refused discovery; other signals still fire */
+    }
+
+    // A spawned `--app` window already exists as a page target: attach to it, or
+    // a blind Target.createTarget would open a SECOND window beside it. An
+    // attached browser already has the page attachBrowser() created in it.
+    if (!this.sessionId && !(await this.attachExistingPage(cdp))) await this.attachNewPage(cdp);
+    const session = this.requireSession();
+
+    this.contexts = new ArtifactContexts(cdp, session, ARTIFACT_SCRIPTS, () => { void this.refreshArtifact(); }, url);
+    await this.contexts.enable(session);
+    await this.contexts.discover();
+    await this.shellEval(SHELL_BRIDGE);
+    await this.contexts.initializeArtifact();
+  }
+
+  /**
+   * Launch our own Chrome at the viewer URL, detached, and connect to it.
+   *
+   * The throwaway profile and the child handle live on the instance: this browser
+   * is ours to kill (see doQuit), and `chrome.on('exit')` is what turns "the user
+   * closed the window" into `windowOpen: false`.
+   */
+  private async spawnBrowser(url: string, executable: { path: string; source: ChromeSource }): Promise<CdpClient> {
     const profile = await fs.mkdtemp(path.join(tmpdir(), 'ds-chrome-'));
     this.profileDir = profile;
 
     // Detached + unref: the window belongs to the user, not the service, so it
     // survives the service stopping/restarting (see stop()/stopBrowser()).
-    const chrome = spawn(chromeBin.path, buildLaunchArgs(this.windowSpec, profile, url), {
+    const chrome = spawn(executable.path, buildLaunchArgs(this.windowSpec, profile, url), {
       stdio: 'ignore',
       detached: true,
     });
     chrome.unref();
     this.chrome = chrome;
-    this.chromeInUse = { path: chromeBin.path, source: chromeBin.source };
+    this.launcher = { kind: 'spawn', path: executable.path, source: executable.source };
     chrome.on('exit', () => {
       // The child dying on its own = the live window is gone (user closed it,
       // or quit Chrome). stop() clears this.chrome before its own kill lands, so
@@ -992,30 +1074,88 @@ export class Browser {
     if (!wsUrl) throw new Error('Chrome did not report a webSocketDebuggerUrl');
 
     const ws = await openSocket(wsUrl);
-    const cdp = new CdpClient(ws);
-    this.cdp = cdp;
-    this.wireEvents(cdp);
-    // Target discovery makes Chrome report `Target.targetDestroyed` for the app
-    // window when the user closes it; without discovery a clean window close
-    // leaves the whole Chrome app running as a background process. Best effort:
-    // a browser that refuses it still works through detachedFromTarget/exit.
-    try {
-      await cdp.send('Target.setDiscoverTargets', { discover: true });
-    } catch {
-      /* older/newer Chrome refused discovery; other signals still fire */
+    return new CdpClient(ws);
+  }
+
+  /**
+   * Attach to a browser that is already running — a sidecar container, another
+   * host, a broker — and open our own page in it at the viewer URL.
+   *
+   * The browser is NOT ours: it is never killed and never asked to close (see
+   * doQuit), only our own page target is. That page is CREATED rather than
+   * adopted, because a shared browser's existing pages belong to whoever else is
+   * using it, and a `--app` window is a spawn-mode idea.
+   */
+  private async attachBrowser(settings: BrowserSettings, url: string): Promise<CdpClient> {
+    const endpoint = settings.cdpEndpoint!;
+    const versionUrl = cdpVersionUrl(endpoint);
+    const version = versionUrl === null ? {} : await this.readCdpVersion(versionUrl, settings);
+    const wsUrl = cdpSocketUrl(endpoint, version);
+    if (!wsUrl) {
+      throw new Error(`${endpoint} did not report a webSocketDebuggerUrl (is it a Chrome DevTools endpoint?)`);
     }
+    let ws: WebSocket;
+    try {
+      ws = await openSocket(wsUrl);
+    } catch (error) {
+      throw new Error(`could not open the CDP socket at ${wsUrl}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const cdp = new CdpClient(ws);
+    const created = await cdp.send('Target.createTarget', { url });
+    this.targetId = String(created.targetId ?? '');
+    const attached = await cdp.send('Target.attachToTarget', { targetId: this.targetId, flatten: true });
+    this.sessionId = String(attached.sessionId ?? '');
+    // The viewer page is loading right now. The shell bridge and the artifact
+    // contexts are wired the moment this returns, and an attach that does not
+    // wait for the document's own script surfaces as "canvas shell context is
+    // unavailable" on the very first /open (the spawned `--app` path gets that
+    // time from launching Chrome and reading its port; an attach has no such
+    // natural delay).
+    await this.waitForDocumentReady(cdp, this.sessionId);
+    this.attachedEndpoint = endpoint;
+    this.launcher = { kind: 'attach', endpoint };
+    return cdp;
+  }
 
-    // The `--app` window already exists as a page target: attach to it. A blind
-    // Target.createTarget here would open a SECOND window beside it; that is
-    // only a last-resort fallback when Chrome reports no page at all.
-    if (!(await this.attachExistingPage(cdp))) await this.attachNewPage(cdp);
-    const session = this.requireSession();
+  /** Wait for the attached page to finish loading. Bounded, and silent on failure. */
+  private async waitForDocumentReady(cdp: CdpClient, session: string): Promise<void> {
+    const deadline = Date.now() + LAUNCH_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      try {
+        const result = await cdp.send(
+          'Runtime.evaluate',
+          { expression: 'document.readyState', returnByValue: true },
+          session,
+        );
+        const state = (result.result as { value?: unknown } | undefined)?.value;
+        if (state === 'interactive' || state === 'complete') return;
+      } catch {
+        /* the execution context is not up yet — ask again */
+      }
+      await delay(50);
+    }
+  }
 
-    this.contexts = new ArtifactContexts(cdp, session, ARTIFACT_SCRIPTS, () => { void this.refreshArtifact(); }, url);
-    await this.contexts.enable(session);
-    await this.contexts.discover();
-    await this.shellEval(SHELL_BRIDGE);
-    await this.contexts.initializeArtifact();
+  /** A CDP endpoint's `/json/version` document, bounded, with actionable errors. */
+  private async readCdpVersion(
+    versionUrl: string,
+    settings: BrowserSettings,
+  ): Promise<{ webSocketDebuggerUrl?: unknown }> {
+    let response: Awaited<ReturnType<typeof fetch>>;
+    try {
+      response = await fetch(versionUrl, { signal: AbortSignal.timeout(LAUNCH_TIMEOUT_MS) });
+    } catch (error) {
+      const reason = fetchFailureReason(error);
+      throw new Error(`could not reach the CDP endpoint in ${settings.file} (${versionUrl}): ${reason}`);
+    }
+    if (!response.ok) {
+      throw new Error(`${versionUrl} answered ${response.status}: ${settings.file} must name a CDP endpoint.`);
+    }
+    try {
+      return (await response.json()) as { webSocketDebuggerUrl?: unknown };
+    } catch {
+      return {};
+    }
   }
 
   /** Create a fresh page target and attach to it (last-resort fallback). */
@@ -1124,6 +1264,14 @@ export class Browser {
     });
     cdp.on('Target.detachedFromTarget', (params) => {
       this.handleTargetGone(String(params.targetId ?? ''), typeof params.sessionId === 'string' ? params.sessionId : undefined);
+    });
+    // An attached browser can vanish without warning (a restarted sidecar, a
+    // dropped socket): the transport closing is the same "the window is gone"
+    // signal a destroyed target is. A deliberate close never reaches here.
+    cdp.onTransportClose(() => {
+      if (this.quitting) return;
+      this.closedAt = Date.now();
+      void this.quit();
     });
   }
 
@@ -1742,7 +1890,7 @@ export class Browser {
       lastPick: this.lastPick,
       pickSeq: this.pickSeq,
       windowOpen: this.closedAt === null && (this.chrome !== null || this.cdp !== null),
-      chrome: this.chromeInUse,
+      launcher: this.launcher,
     };
   }
 
@@ -1791,10 +1939,14 @@ export class Browser {
           /* target already gone (the user closed the window first) */
         }
       }
-      try {
-        await cdp.send('Browser.close');
-      } catch {
-        /* the socket can die the moment Chrome quits */
+      // A browser we merely attached to is not ours to close: another session or
+      // another tool may be using it. Only one we started is quit.
+      if (this.attachedEndpoint === null) {
+        try {
+          await cdp.send('Browser.close');
+        } catch {
+          /* the socket can die the moment Chrome quits */
+        }
       }
       cdp.close();
       this.cdp = null;
@@ -1902,6 +2054,7 @@ export class Browser {
     }
     this.sessionId = null;
     this.targetId = null;
+    this.attachedEndpoint = null;
     this.starting = null;
     this.launchUrl = null;
     this.debuggingPort = null;

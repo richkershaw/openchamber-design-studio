@@ -64,9 +64,10 @@ Requirements:
 
 - **OpenChamber ≥ 2.2.0** (the manifest declares `engines.openchamber` as
   `>=2.2.0`).
-- **Chrome or Chromium** installed (the local service launches it). The extension
-  resolves the executable in this order: `DS_CHROME_PATH`; then `path` in
-  `$XDG_CONFIG_HOME/openchamber/design-studio/browser.json` (or
+- **A browser to drive**: Chrome or Chromium this machine can launch, or one it
+  can reach over CDP (see *Where the browser runs* below). For a launch the
+  extension resolves the executable in this order: `DS_CHROME_PATH`; then `path`
+  in `$XDG_CONFIG_HOME/openchamber/design-studio/browser.json` (or
   `~/.config/openchamber/design-studio/browser.json`); then `google-chrome`,
   `chromium`, `chrome` and friends on `PATH`; then the usual install locations
   for macOS, Linux and Windows. Prefer the config file over the environment
@@ -115,6 +116,46 @@ agent edits a file. Because it is a real browser, your React/Vite dev server run
 and hot-reloads exactly as it does outside OpenChamber.
 
 ![A live Google Chrome app window showing a React dev server preview, with the Design Studio workspace beside it in OpenChamber.](docs/screenshots/feature-live-preview-pick-1280.png)
+
+### Where the browser runs
+
+The service gets a browser in one of two ways, both configured in
+`$XDG_CONFIG_HOME/openchamber/design-studio/browser.json` (or
+`~/.config/openchamber/design-studio/browser.json`):
+
+- **Launch one** (the default). `path` names the executable, or it is resolved —
+  `DS_CHROME_PATH`, then `path`, then `google-chrome`/`chromium`/`chrome` on
+  `PATH`, then the usual macOS, Linux and Windows install locations. A resolved
+  launch is the detached `--app` window described above. An explicit `path` or
+  `DS_CHROME_PATH` that is not executable is an error naming it, never a silent
+  fallback.
+- **Attach to one.** `cdpEndpoint` names a browser that is already running — a
+  sidecar container, another machine, a broker — and the service drives it over
+  CDP instead of starting anything:
+
+  ```json
+  { "cdpEndpoint": "http://sidecar:9222" }
+  ```
+
+  The page the extension drives is a **new target** in that browser, created at
+  the viewer URL. The browser is not yours to lose: it is never killed and never
+  asked to close, and only that one page is closed when the session's window
+  ends. `/state` reports which browser is in use (`launcher`, either
+  `{ kind: "spawn", path, source }` or `{ kind: "attach", endpoint }`).
+
+Attaching has one requirement: the browser must be able to reach **this
+machine's loopback**, because the viewer shell and the project under design are
+served here and the browser loads them. A sidecar container gets that for free by
+sharing the service's network namespace:
+
+```bash
+docker run -d --network container:openchamber \
+  --entrypoint /path/to/chrome ghcr.io/browserless/chromium \
+  --headless=new --no-sandbox --remote-debugging-port=9222 --remote-debugging-address=0.0.0.0
+```
+
+Reaching a browser across a bridge network needs a browser-facing host setting,
+which is not implemented yet: a browser there cannot load a `127.0.0.1` URL.
 
 ### Pick an element, get a chat reference
 
@@ -194,9 +235,9 @@ project it is pointed at.
   running OpenChamber build is older.
 - **Platform:** desktop and web only. VS Code and mobile mark the guest catalog
   `unsupported` and do not load the extension.
-- **Browser:** a local Chrome or Chromium. macOS, Linux and Windows install
-  locations are all probed, and the executable can be named explicitly in
-  `browser.json` (see Requirements above).
+- **Browser:** a local Chrome or Chromium, or any browser reachable over CDP — a
+  sidecar container, another host, a broker. `browser.json` names either the
+  executable or the endpoint (see *Where the browser runs* above).
 
 ## Development
 

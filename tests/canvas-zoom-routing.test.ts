@@ -39,7 +39,7 @@ function backend(rect={x:120,y:80,width:640,height:400}){
   const canvas={getBoundingClientRect:()=>({x:20,y:40,width:800,height:600})};
   const api={zoomCamera:(event:EventData)=>{calls.push(event);return true;}};
   b.shellEval=async(expression:string)=>runInNewContext(expression,{document:{getElementById:(id:string)=>id==='preview'?frame:canvas},__dsCanvas:api,Number});
-  b.wireEvents({on:(name:string,callback:any)=>{handlers.set(name,callback);return()=>undefined;}});
+  b.wireEvents({on:(name:string,callback:any)=>{handlers.set(name,callback);return()=>undefined;},onTransportClose:()=>undefined});
   const send=(value:EventData)=>handlers.get('Runtime.bindingCalled')!({name:'__dsArtifactEvent',payload:JSON.stringify(value),executionContextId:7},'artifact');
   const flush=async()=>{await b.operationTail;await Promise.resolve();};
   return {b,calls,send,flush,dimensions,replace(){current={...current,unique:'document-b'};}};

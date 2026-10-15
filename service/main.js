@@ -221,19 +221,11 @@ var PROBE_SCRIPT = String.raw`(function () {
 })();`;
 var PROBE_EXPR = "window.__dsProbe ? window.__dsProbe() : null";
 
-// service/chrome-path.ts
-import { accessSync, constants, readFileSync, statSync } from "node:fs";
+// service/browser-settings.ts
+import { readFileSync } from "node:fs";
+
+// service/platform-env.ts
 import path2 from "node:path";
-var CHROME_PATH_ENV = "DS_CHROME_PATH";
-var CHROME_CONFIG_REL = "openchamber/design-studio/browser.json";
-var PATH_CANDIDATES = [
-  "google-chrome",
-  "google-chrome-stable",
-  "chromium",
-  "chromium-browser",
-  "chrome",
-  "chrome-headless-shell"
-];
 function paths(platform) {
   return platform === "win32" ? path2.win32 : path2.posix;
 }
@@ -253,17 +245,6 @@ function firstEnv(env, ...names) {
   }
   return void 0;
 }
-function browserConfigPath(env, platform) {
-  const p = paths(platform);
-  const xdg = envGet(env, "XDG_CONFIG_HOME")?.trim();
-  if (xdg) return p.join(xdg, CHROME_CONFIG_REL);
-  if (platform === "win32") {
-    const appData = firstEnv(env, "APPDATA");
-    if (appData) return p.join(appData, CHROME_CONFIG_REL);
-  }
-  const home = homeDir(env);
-  return home ? p.join(home, ".config", CHROME_CONFIG_REL) : CHROME_CONFIG_REL;
-}
 function homeDir(env) {
   const home = firstEnv(env, "HOME", "USERPROFILE");
   if (home) return home;
@@ -275,6 +256,105 @@ function expandHome(value, env, platform) {
   if (!value.startsWith("~/") && !value.startsWith("~\\")) return value;
   const home = homeDir(env);
   return home ? paths(platform).join(home, value.slice(2)) : value;
+}
+
+// service/browser-settings.ts
+var BROWSER_CONFIG_REL = "openchamber/design-studio/browser.json";
+function browserConfigPath(env, platform) {
+  const p = paths(platform);
+  const xdg = envGet(env, "XDG_CONFIG_HOME")?.trim();
+  if (xdg) return p.join(xdg, BROWSER_CONFIG_REL);
+  if (platform === "win32") {
+    const appData = firstEnv(env, "APPDATA");
+    if (appData) return p.join(appData, BROWSER_CONFIG_REL);
+  }
+  const home = homeDir(env);
+  return home ? p.join(home, ".config", BROWSER_CONFIG_REL) : BROWSER_CONFIG_REL;
+}
+function nonBlankString(value) {
+  return typeof value === "string" && value.trim() !== "" ? value.trim() : null;
+}
+function isCdpEndpoint(value) {
+  try {
+    const url = new URL(value);
+    return (url.protocol === "http:" || url.protocol === "https:" || url.protocol === "ws:" || url.protocol === "wss:") && url.host !== "";
+  } catch {
+    return false;
+  }
+}
+function parseBrowserSettings(text, file) {
+  if (text === null) return { file };
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return { file, error: `${file} is not valid JSON.` };
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { file, error: `${file} must contain a JSON object.` };
+  }
+  const record = parsed;
+  const settings = { file };
+  if (record.path !== void 0) {
+    const value = nonBlankString(record.path);
+    if (value === null) return { file, error: `${file} has a "path" that is not a non-empty string.` };
+    settings.path = value;
+  }
+  if (record.cdpEndpoint !== void 0) {
+    const value = nonBlankString(record.cdpEndpoint);
+    if (value === null || !isCdpEndpoint(value)) {
+      return { file, error: `${file} has a "cdpEndpoint" that is not an http(s) or ws(s) URL.` };
+    }
+    settings.cdpEndpoint = value;
+  }
+  return settings;
+}
+function readBrowserSettings(env = process.env, platform = process.platform, readFile = defaultReadFile) {
+  const file = browserConfigPath(env, platform);
+  return parseBrowserSettings(readFile(file), file);
+}
+function defaultReadFile(abs) {
+  try {
+    return readFileSync(abs, "utf8");
+  } catch {
+    return null;
+  }
+}
+function cdpVersionUrl(endpoint) {
+  const url = new URL(endpoint);
+  if (url.protocol === "ws:" || url.protocol === "wss:") return null;
+  return new URL("/json/version", url).href;
+}
+function cdpSocketUrl(endpoint, version) {
+  const url = new URL(endpoint);
+  if (url.protocol === "ws:" || url.protocol === "wss:") return url.href;
+  const reported = nonBlankString(version.webSocketDebuggerUrl);
+  if (reported === null) return null;
+  let ws;
+  try {
+    ws = new URL(reported);
+  } catch {
+    return null;
+  }
+  if (ws.protocol !== "ws:" && ws.protocol !== "wss:") return null;
+  const scheme = url.protocol === "https:" ? "wss:" : "ws:";
+  return new URL(`${scheme}//${url.host}${ws.pathname}${ws.search}`).href;
+}
+
+// service/chrome-path.ts
+import { accessSync, constants, statSync } from "node:fs";
+var CHROME_PATH_ENV = "DS_CHROME_PATH";
+var PATH_CANDIDATES = [
+  "google-chrome",
+  "google-chrome-stable",
+  "chromium",
+  "chromium-browser",
+  "chrome",
+  "chrome-headless-shell"
+];
+function pathEntries(env, platform) {
+  const raw = envGet(env, "PATH") ?? "";
+  return raw.split(platform === "win32" ? ";" : ":").map((entry) => entry.trim().replace(/^"|"$/g, "")).filter((entry) => entry !== "");
 }
 function defaultChromeCandidates(env, platform) {
   const p = paths(platform);
@@ -309,12 +389,8 @@ function defaultChromeCandidates(env, platform) {
   );
   return out;
 }
-function pathEntries(env, platform) {
-  const raw = envGet(env, "PATH") ?? "";
-  return raw.split(platform === "win32" ? ";" : ":").map((entry) => entry.trim().replace(/^"|"$/g, "")).filter((entry) => entry !== "");
-}
 function resolveChromeExecutable(lookup) {
-  const { env, platform, isExecutable, readConfig } = lookup;
+  const { env, platform, isExecutable, configFile } = lookup;
   const p = paths(platform);
   const tried = [];
   const explicit = envGet(env, CHROME_PATH_ENV)?.trim();
@@ -323,26 +399,11 @@ function resolveChromeExecutable(lookup) {
     if (isExecutable(explicit)) return { ok: true, path: explicit, source: "env" };
     return { ok: false, tried, error: `${CHROME_PATH_ENV} is set to ${explicit}, which is not an executable file.` };
   }
-  const configPath = browserConfigPath(env, platform);
-  tried.push(configPath);
-  const text = readConfig();
-  if (text !== null) {
-    let parsed;
-    try {
-      parsed = JSON.parse(text);
-    } catch {
-      return { ok: false, tried, error: `${configPath} is not valid JSON.` };
-    }
-    const named = parsed && typeof parsed === "object" ? parsed.path : void 0;
-    if (named !== void 0) {
-      if (typeof named !== "string" || named.trim() === "") {
-        return { ok: false, tried, error: `${configPath} has a "path" that is not a non-empty string.` };
-      }
-      const abs = expandHome(named.trim(), env, platform);
-      tried.push(abs);
-      if (isExecutable(abs)) return { ok: true, path: abs, source: "config" };
-      return { ok: false, tried, error: `${configPath} names ${abs}, which is not an executable file.` };
-    }
+  if (lookup.configuredPath !== void 0) {
+    const abs = expandHome(lookup.configuredPath, env, platform);
+    tried.push(abs);
+    if (isExecutable(abs)) return { ok: true, path: abs, source: "config" };
+    return { ok: false, tried, error: `${configFile} names ${abs}, which is not an executable file.` };
   }
   const entries = pathEntries(env, platform);
   const names = platform === "win32" ? PATH_CANDIDATES.flatMap((name) => [name, `${name}.exe`]) : PATH_CANDIDATES;
@@ -360,7 +421,7 @@ function resolveChromeExecutable(lookup) {
   return {
     ok: false,
     tried,
-    error: `No Chrome or Chromium found. Put the browser's path in ${configPath} as {"path":"\u2026"} (or set ${CHROME_PATH_ENV}), or install Chrome. Tried ${tried.length} locations.`
+    error: `No Chrome or Chromium found. Put the browser's path in ${configFile} as {"path":"\u2026"} (or set ${CHROME_PATH_ENV}), or install Chrome. Tried ${tried.length} locations.`
   };
 }
 function isExecutableFile(abs) {
@@ -371,21 +432,6 @@ function isExecutableFile(abs) {
   } catch {
     return false;
   }
-}
-function findChrome() {
-  const platform = process.platform;
-  return resolveChromeExecutable({
-    env: process.env,
-    platform,
-    isExecutable: isExecutableFile,
-    readConfig: () => {
-      try {
-        return readFileSync(browserConfigPath(process.env, platform), "utf8");
-      } catch {
-        return null;
-      }
-    }
-  });
 }
 
 // service/viewer-server.ts
@@ -1280,6 +1326,12 @@ function emptyProbeReport() {
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+function fetchFailureReason(error) {
+  if (!(error instanceof Error)) return String(error);
+  const cause = error.cause;
+  if (cause instanceof Error && cause.message) return `${error.message}: ${cause.message}`;
+  return error.message;
+}
 function openSocket(url) {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(url);
@@ -1302,11 +1354,17 @@ var CdpClient = class {
   handlers = /* @__PURE__ */ new Map();
   closed = false;
   closeError = null;
+  /** Notified once when the socket dies on its own; never on a deliberate close. */
+  transportClosed = null;
   constructor(ws) {
     this.ws = ws;
     ws.addEventListener("message", (event) => this.onMessage(event));
     ws.addEventListener("close", () => this.onClose(new Error("CDP socket closed")));
     ws.addEventListener("error", () => this.onClose(new Error("CDP socket error")));
+  }
+  /** Called when the socket dies by itself — the browser went away. */
+  onTransportClose(handler) {
+    this.transportClosed = handler;
   }
   onMessage(event) {
     let message;
@@ -1344,6 +1402,7 @@ var CdpClient = class {
       entry.reject(error);
     }
     this.pending.clear();
+    this.transportClosed?.();
   }
   send(method, params = {}, sessionId) {
     if (this.closed) return Promise.reject(this.closeError ?? new Error("CDP closed"));
@@ -1911,8 +1970,10 @@ var Browser = class {
   debuggingPort = null;
   /** Set when the Chrome child exits on its own; drives `windowOpen`. */
   closedAt = null;
-  /** The executable the last launch resolved and used; diagnostics only. */
-  chromeInUse = null;
+  /** How the last launch got its browser; diagnostics only. */
+  launcher = null;
+  /** The endpoint of the browser we attached to, while we are attached to it. */
+  attachedEndpoint = null;
   /** True while an observed/intentional close is tearing Chrome down. */
   quitting = false;
   /** The in-flight teardown, so a second close (or stop) joins it instead of racing. */
@@ -1953,20 +2014,53 @@ var Browser = class {
     if (!isWebSafeUrl(this.requestedUrl)) {
       throw new Error("launch() needs a web-safe --app URL");
     }
-    const chromeBin = findChrome();
-    if (!chromeBin.ok) throw new Error(chromeBin.error);
+    const settings = readBrowserSettings();
+    if (settings.error) throw new Error(settings.error);
+    const executable = settings.cdpEndpoint ? null : resolveChromeExecutable({
+      env: process.env,
+      platform: process.platform,
+      isExecutable: isExecutableFile,
+      configuredPath: settings.path,
+      configFile: settings.file
+    });
+    if (executable && !executable.ok) throw new Error(executable.error);
     this.viewer = await startViewerServer({ url: this.requestedUrl, pages: [], viewport: this.viewport() });
     const url = this.viewer.url;
     this.launchUrl = url;
+    const cdp = executable ? await this.spawnBrowser(url, executable) : await this.attachBrowser(settings, url);
+    this.cdp = cdp;
+    this.wireEvents(cdp);
+    try {
+      await cdp.send("Target.setDiscoverTargets", { discover: true });
+    } catch {
+    }
+    if (!this.sessionId && !await this.attachExistingPage(cdp)) await this.attachNewPage(cdp);
+    const session = this.requireSession();
+    this.contexts = new ArtifactContexts(cdp, session, ARTIFACT_SCRIPTS, () => {
+      void this.refreshArtifact();
+    }, url);
+    await this.contexts.enable(session);
+    await this.contexts.discover();
+    await this.shellEval(SHELL_BRIDGE);
+    await this.contexts.initializeArtifact();
+  }
+  /**
+   * Launch our own Chrome at the viewer URL, detached, and connect to it.
+   *
+   * The throwaway profile and the child handle live on the instance: this browser
+   * is ours to kill (see doQuit), and `chrome.on('exit')` is what turns "the user
+   * closed the window" into `windowOpen: false`.
+   */
+  async spawnBrowser(url, executable) {
     const profile = await fs2.mkdtemp(path3.join(tmpdir(), "ds-chrome-"));
     this.profileDir = profile;
-    const chrome = spawn(chromeBin.path, buildLaunchArgs(this.windowSpec, profile, url), {
+    const chrome = spawn(executable.path, buildLaunchArgs(this.windowSpec, profile, url), {
       stdio: "ignore",
       detached: true
     });
     chrome.unref();
     this.chrome = chrome;
-    this.chromeInUse = { path: chromeBin.path, source: chromeBin.source };
+    this.launcher = { kind: "spawn", path: executable.path, source: executable.source };
     chrome.on("exit", () => {
       if (this.chrome !== chrome) return;
       this.closedAt = Date.now();
@@ -1978,22 +2072,75 @@ var Browser = class {
     const wsUrl = version.webSocketDebuggerUrl;
     if (!wsUrl) throw new Error("Chrome did not report a webSocketDebuggerUrl");
     const ws = await openSocket(wsUrl);
-    const cdp = new CdpClient(ws);
-    this.cdp = cdp;
-    this.wireEvents(cdp);
-    try {
-      await cdp.send("Target.setDiscoverTargets", { discover: true });
-    } catch {
+    return new CdpClient(ws);
+  }
+  /**
+   * Attach to a browser that is already running — a sidecar container, another
+   * host, a broker — and open our own page in it at the viewer URL.
+   *
+   * The browser is NOT ours: it is never killed and never asked to close (see
+   * doQuit), only our own page target is. That page is CREATED rather than
+   * adopted, because a shared browser's existing pages belong to whoever else is
+   * using it, and a `--app` window is a spawn-mode idea.
+   */
+  async attachBrowser(settings, url) {
+    const endpoint = settings.cdpEndpoint;
+    const versionUrl = cdpVersionUrl(endpoint);
+    const version = versionUrl === null ? {} : await this.readCdpVersion(versionUrl, settings);
+    const wsUrl = cdpSocketUrl(endpoint, version);
+    if (!wsUrl) {
+      throw new Error(`${endpoint} did not report a webSocketDebuggerUrl (is it a Chrome DevTools endpoint?)`);
     }
-    if (!await this.attachExistingPage(cdp)) await this.attachNewPage(cdp);
-    const session = this.requireSession();
-    this.contexts = new ArtifactContexts(cdp, session, ARTIFACT_SCRIPTS, () => {
-      void this.refreshArtifact();
-    }, url);
-    await this.contexts.enable(session);
-    await this.contexts.discover();
-    await this.shellEval(SHELL_BRIDGE);
-    await this.contexts.initializeArtifact();
+    let ws;
+    try {
+      ws = await openSocket(wsUrl);
+    } catch (error) {
+      throw new Error(`could not open the CDP socket at ${wsUrl}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const cdp = new CdpClient(ws);
+    const created = await cdp.send("Target.createTarget", { url });
+    this.targetId = String(created.targetId ?? "");
+    const attached = await cdp.send("Target.attachToTarget", { targetId: this.targetId, flatten: true });
+    this.sessionId = String(attached.sessionId ?? "");
+    await this.waitForDocumentReady(cdp, this.sessionId);
+    this.attachedEndpoint = endpoint;
+    this.launcher = { kind: "attach", endpoint };
+    return cdp;
+  }
+  /** Wait for the attached page to finish loading. Bounded, and silent on failure. */
+  async waitForDocumentReady(cdp, session) {
+    const deadline = Date.now() + LAUNCH_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      try {
+        const result = await cdp.send(
+          "Runtime.evaluate",
+          { expression: "document.readyState", returnByValue: true },
+          session
+        );
+        const state = result.result?.value;
+        if (state === "interactive" || state === "complete") return;
+      } catch {
+      }
+      await delay(50);
+    }
+  }
+  /** A CDP endpoint's `/json/version` document, bounded, with actionable errors. */
+  async readCdpVersion(versionUrl, settings) {
+    let response;
+    try {
+      response = await fetch(versionUrl, { signal: AbortSignal.timeout(LAUNCH_TIMEOUT_MS) });
+    } catch (error) {
+      const reason = fetchFailureReason(error);
+      throw new Error(`could not reach the CDP endpoint in ${settings.file} (${versionUrl}): ${reason}`);
+    }
+    if (!response.ok) {
+      throw new Error(`${versionUrl} answered ${response.status}: ${settings.file} must name a CDP endpoint.`);
+    }
+    try {
+      return await response.json();
+    } catch {
+      return {};
+    }
   }
   /** Create a fresh page target and attach to it (last-resort fallback). */
   async attachNewPage(cdp) {
@@ -2092,6 +2239,11 @@ var Browser = class {
     });
     cdp.on("Target.detachedFromTarget", (params) => {
       this.handleTargetGone(String(params.targetId ?? ""), typeof params.sessionId === "string" ? params.sessionId : void 0);
+    });
+    cdp.onTransportClose(() => {
+      if (this.quitting) return;
+      this.closedAt = Date.now();
+      void this.quit();
     });
   }
   /**
@@ -2740,7 +2892,7 @@ var Browser = class {
       lastPick: this.lastPick,
       pickSeq: this.pickSeq,
       windowOpen: this.closedAt === null && (this.chrome !== null || this.cdp !== null),
-      chrome: this.chromeInUse
+      launcher: this.launcher
     };
   }
   /**
@@ -2784,9 +2936,11 @@ var Browser = class {
         } catch {
         }
       }
-      try {
-        await cdp.send("Browser.close");
-      } catch {
+      if (this.attachedEndpoint === null) {
+        try {
+          await cdp.send("Browser.close");
+        } catch {
+        }
       }
       cdp.close();
       this.cdp = null;
@@ -2888,6 +3042,7 @@ var Browser = class {
     }
     this.sessionId = null;
     this.targetId = null;
+    this.attachedEndpoint = null;
     this.starting = null;
     this.launchUrl = null;
     this.debuggingPort = null;
@@ -7299,7 +7454,7 @@ var server = http.createServer(async (req, res) => {
           lastPick: null,
           pickSeq: 0,
           windowOpen: false,
-          chrome: null,
+          launcher: null,
           bridgeActive: bridge.active()
         });
         return;

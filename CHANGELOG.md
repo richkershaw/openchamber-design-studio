@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Attach to a browser over CDP.** `cdpEndpoint` in `browser.json` makes the
+  service drive a browser it did not start — a sidecar container, another host, a
+  broker — instead of launching one. The page it drives is a new target in that
+  browser, the browser is never killed or asked to close, and only the
+  extension's own page is closed when the session's window ends. A browser that
+  vanishes takes the same "window is gone" path a closed window does, via the
+  CDP transport closing.
+- **A resolved browser executable.** The launch path now finds Chrome instead of
+  assuming macOS: `DS_CHROME_PATH`, then `path` in `browser.json`, then
+  `google-chrome`/`chromium`/`chrome` on `PATH`, then the platform's install
+  locations for macOS, Linux and Windows. An explicit path that is not
+  executable fails with a message naming it, and `/state` reports the browser in
+  use (`launcher`).
+
 ### Planned
 
 These are **not implemented yet** — they are noted here so the roadmap is

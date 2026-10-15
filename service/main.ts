@@ -406,7 +406,7 @@ const server = http.createServer(async (req, res) => {
           lastPick: null,
           pickSeq: 0,
           windowOpen: false,
-          chrome: null,
+          launcher: null,
           bridgeActive: bridge.active(),
         });
         return;
