@@ -1688,12 +1688,6 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
   function getState() {
     return callService("/state");
   }
-  function claimPickBridge(token) {
-    return callService("/bridge", void 0, "POST", JSON.stringify(token ? { token } : {}));
-  }
-  function releasePickBridge(token) {
-    return callService("/bridge", void 0, "POST", JSON.stringify({ release: true, token }));
-  }
   function focusLive() {
     return callService("/focus", void 0, "POST");
   }
@@ -4343,50 +4337,6 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
       await host.toast({ kind: "error", message: `Could not attach: ${error instanceof Error ? error.message : String(error)}` });
     }
   }
-  var bridgeToken = null;
-  var bridgeHeld = false;
-  var delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-  async function holdPickBridge() {
-    if (bridgeHeld) return null;
-    bridgeHeld = true;
-    try {
-      while (state.mode.on) {
-        try {
-          const claim = await claimPickBridge(bridgeToken ?? void 0);
-          if (!claim.ok || !claim.token) break;
-          bridgeToken = claim.token;
-          const stateData = await getState();
-          state.url = stateData.url;
-          state.title = stateData.title;
-          state.windowOpen = stateData.windowOpen;
-          if (stateData.lastPick && stateData.pickSeq > state.lastSeq) {
-            state.lastSeq = stateData.pickSeq;
-            await addToChat({ ...stateData.lastPick, seq: stateData.pickSeq, url: stateData.url, pickedAt: /* @__PURE__ */ new Date() });
-          }
-          if (!stateData.windowOpen) break;
-        } catch {
-        }
-        await delay(700);
-      }
-    } finally {
-      bridgeHeld = false;
-      const token = bridgeToken;
-      bridgeToken = null;
-      if (token) void releasePickBridge(token).catch(() => void 0);
-    }
-    return null;
-  }
-  async function resolveOrBridge(request) {
-    const chip = await resolveDesignCommand(request.args);
-    if (!state.mode.on) return chip;
-    if (bridgeHeld) return chip;
-    try {
-      const stateData = await getState();
-      if (stateData.bridgeActive) return chip;
-    } catch {
-    }
-    return holdPickBridge();
-  }
   function openStatus(message, kind = "info") {
     setStatus(message, kind);
   }
@@ -6062,7 +6012,7 @@ Source: ${reference.sourceDirectory}`;
   async function main() {
     const root = document.getElementById("root");
     if (!root) throw new Error("missing #root");
-    host.onResolve((request) => resolveOrBridge(request));
+    host.onResolve((request) => resolveDesignCommand(request.args));
     let started = false;
     host.onReady((context) => {
       applyHostReady(context, document.documentElement);
