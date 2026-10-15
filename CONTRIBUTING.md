@@ -12,8 +12,11 @@ your first change.
   `node-version: 22`). The build targets ES2020 (panel) and Node 20 (service).
 - **OpenChamber ≥ 2.2.0** to load the extension (`openchamber.engines.openchamber`
   in `package.json`).
-- **Google Chrome** at `/Applications/Google Chrome.app` for the two integration
-  tests (see below). Set `DS_CHROME_PATH` to point elsewhere.
+- **Chrome or Chromium** for the two integration tests (see below). Point the
+  launcher at it with `DS_CHROME_PATH`, or with `path` in
+  `$XDG_CONFIG_HOME/openchamber/design-studio/browser.json`. A directly-run
+  service does receive the variable; inside OpenChamber the host filters the
+  environment, so the config file is what works there.
 
 ## Set up
 
@@ -53,8 +56,8 @@ Two integration tests drive a **real** Chrome and are excluded from CI:
 - `tests/browser.test.ts`
 - `tests/provider.test.ts`
 
-They need a local Google Chrome (`/Applications/Google Chrome.app`, or
-`DS_CHROME_PATH`) and a **clean set of Chrome profiles** — a stale or locked
+They need a local Chrome or Chromium (the launcher resolves it — see Requirements
+above) and a **clean set of Chrome profiles** — a stale or locked
 throwaway profile makes them fail for environment reasons, not because the code
 regressed. Run the rest the same way CI does:
 

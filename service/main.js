@@ -3,7 +3,7 @@ import { createRequire } from 'node:module'; const require = createRequire(impor
 // service/main.ts
 import http from "node:http";
 import { promises as fs8 } from "node:fs";
-import path10 from "node:path";
+import path11 from "node:path";
 
 // service/studio-config.ts
 import { promises as fs } from "node:fs";
@@ -50,14 +50,14 @@ async function writeStudioConfig(root, rel, text) {
 import { execFile as execFile2, spawn as spawn2 } from "node:child_process";
 import { promises as fs3 } from "node:fs";
 import { createServer as createServer2 } from "node:net";
-import path3 from "node:path";
+import path4 from "node:path";
 import { promisify } from "node:util";
 
 // service/browser.ts
 import { execFile, spawn } from "node:child_process";
 import { promises as fs2 } from "node:fs";
 import { tmpdir } from "node:os";
-import path2 from "node:path";
+import path3 from "node:path";
 
 // shared/probe-script.ts
 var PROBE_SCRIPT = String.raw`(function () {
@@ -220,6 +220,173 @@ var PROBE_SCRIPT = String.raw`(function () {
   };
 })();`;
 var PROBE_EXPR = "window.__dsProbe ? window.__dsProbe() : null";
+
+// service/chrome-path.ts
+import { accessSync, constants, readFileSync, statSync } from "node:fs";
+import path2 from "node:path";
+var CHROME_PATH_ENV = "DS_CHROME_PATH";
+var CHROME_CONFIG_REL = "openchamber/design-studio/browser.json";
+var PATH_CANDIDATES = [
+  "google-chrome",
+  "google-chrome-stable",
+  "chromium",
+  "chromium-browser",
+  "chrome",
+  "chrome-headless-shell"
+];
+function paths(platform) {
+  return platform === "win32" ? path2.win32 : path2.posix;
+}
+function envGet(env, name) {
+  const direct = env[name];
+  if (direct !== void 0) return direct;
+  const wanted = name.toUpperCase();
+  for (const [key, value] of Object.entries(env)) {
+    if (key.toUpperCase() === wanted) return value;
+  }
+  return void 0;
+}
+function firstEnv(env, ...names) {
+  for (const name of names) {
+    const value = envGet(env, name)?.trim();
+    if (value) return value;
+  }
+  return void 0;
+}
+function browserConfigPath(env, platform) {
+  const p = paths(platform);
+  const xdg = envGet(env, "XDG_CONFIG_HOME")?.trim();
+  if (xdg) return p.join(xdg, CHROME_CONFIG_REL);
+  if (platform === "win32") {
+    const appData = firstEnv(env, "APPDATA");
+    if (appData) return p.join(appData, CHROME_CONFIG_REL);
+  }
+  const home = homeDir(env);
+  return home ? p.join(home, ".config", CHROME_CONFIG_REL) : CHROME_CONFIG_REL;
+}
+function homeDir(env) {
+  const home = firstEnv(env, "HOME", "USERPROFILE");
+  if (home) return home;
+  const drive = envGet(env, "HOMEDRIVE")?.trim();
+  const share = envGet(env, "HOMEPATH")?.trim();
+  return drive && share ? `${drive}${share}` : void 0;
+}
+function expandHome(value, env, platform) {
+  if (!value.startsWith("~/") && !value.startsWith("~\\")) return value;
+  const home = homeDir(env);
+  return home ? paths(platform).join(home, value.slice(2)) : value;
+}
+function defaultChromeCandidates(env, platform) {
+  const p = paths(platform);
+  const out = [];
+  if (platform === "darwin") {
+    const homes = ["/Applications"];
+    const home = homeDir(env);
+    if (home) homes.push(p.join(home, "Applications"));
+    for (const base of homes) {
+      out.push(p.join(base, "Google Chrome.app/Contents/MacOS/Google Chrome"));
+      out.push(p.join(base, "Chromium.app/Contents/MacOS/Chromium"));
+      out.push(p.join(base, "Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary"));
+    }
+    return out;
+  }
+  if (platform === "win32") {
+    for (const root of [envGet(env, "PROGRAMFILES"), envGet(env, "PROGRAMFILES(X86)"), envGet(env, "LOCALAPPDATA")]) {
+      const base = root?.trim();
+      if (!base) continue;
+      out.push(p.join(base, "Google/Chrome/Application/chrome.exe"));
+      out.push(p.join(base, "Chromium/Application/chrome.exe"));
+    }
+    return out;
+  }
+  out.push(
+    "/usr/bin/google-chrome",
+    "/usr/bin/google-chrome-stable",
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+    "/usr/local/bin/chromium",
+    "/snap/bin/chromium"
+  );
+  return out;
+}
+function pathEntries(env, platform) {
+  const raw = envGet(env, "PATH") ?? "";
+  return raw.split(platform === "win32" ? ";" : ":").map((entry) => entry.trim().replace(/^"|"$/g, "")).filter((entry) => entry !== "");
+}
+function resolveChromeExecutable(lookup) {
+  const { env, platform, isExecutable, readConfig } = lookup;
+  const p = paths(platform);
+  const tried = [];
+  const explicit = envGet(env, CHROME_PATH_ENV)?.trim();
+  if (explicit) {
+    tried.push(explicit);
+    if (isExecutable(explicit)) return { ok: true, path: explicit, source: "env" };
+    return { ok: false, tried, error: `${CHROME_PATH_ENV} is set to ${explicit}, which is not an executable file.` };
+  }
+  const configPath = browserConfigPath(env, platform);
+  tried.push(configPath);
+  const text = readConfig();
+  if (text !== null) {
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      return { ok: false, tried, error: `${configPath} is not valid JSON.` };
+    }
+    const named = parsed && typeof parsed === "object" ? parsed.path : void 0;
+    if (named !== void 0) {
+      if (typeof named !== "string" || named.trim() === "") {
+        return { ok: false, tried, error: `${configPath} has a "path" that is not a non-empty string.` };
+      }
+      const abs = expandHome(named.trim(), env, platform);
+      tried.push(abs);
+      if (isExecutable(abs)) return { ok: true, path: abs, source: "config" };
+      return { ok: false, tried, error: `${configPath} names ${abs}, which is not an executable file.` };
+    }
+  }
+  const entries = pathEntries(env, platform);
+  const names = platform === "win32" ? PATH_CANDIDATES.flatMap((name) => [name, `${name}.exe`]) : PATH_CANDIDATES;
+  for (const name of names) {
+    for (const entry of entries) {
+      const abs = p.join(entry, name);
+      tried.push(abs);
+      if (isExecutable(abs)) return { ok: true, path: abs, source: "path" };
+    }
+  }
+  for (const abs of defaultChromeCandidates(env, platform)) {
+    tried.push(abs);
+    if (isExecutable(abs)) return { ok: true, path: abs, source: "default" };
+  }
+  return {
+    ok: false,
+    tried,
+    error: `No Chrome or Chromium found. Put the browser's path in ${configPath} as {"path":"\u2026"} (or set ${CHROME_PATH_ENV}), or install Chrome. Tried ${tried.length} locations.`
+  };
+}
+function isExecutableFile(abs) {
+  try {
+    if (!statSync(abs).isFile()) return false;
+    accessSync(abs, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+function findChrome() {
+  const platform = process.platform;
+  return resolveChromeExecutable({
+    env: process.env,
+    platform,
+    isExecutable: isExecutableFile,
+    readConfig: () => {
+      try {
+        return readFileSync(browserConfigPath(process.env, platform), "utf8");
+      } catch {
+        return null;
+      }
+    }
+  });
+}
 
 // service/viewer-server.ts
 import { createServer } from "node:http";
@@ -1054,7 +1221,6 @@ var ArtifactContexts = class {
 };
 
 // service/browser.ts
-var CHROME_PATH = process.env.DS_CHROME_PATH ?? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 var VIEWPORT_WIDTH = 1280;
 var VIEWPORT_HEIGHT = 800;
 var CDP_TIMEOUT_MS = 3e4;
@@ -1670,7 +1836,7 @@ function validCameraZoom(value) {
   return value.action !== "wheel" || ["deltaY", "x", "y"].every((key) => typeof value[key] === "number");
 }
 async function reapOrphanChrome() {
-  const prefix = path2.join(tmpdir(), "ds-chrome-");
+  const prefix = path3.join(tmpdir(), "ds-chrome-");
   let stdout;
   try {
     ({ stdout } = await new Promise((resolve, reject) => {
@@ -1692,7 +1858,7 @@ async function reapOrphanChrome() {
     if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) continue;
     pids.push(pid);
     const dirMatch = line.match(/--user-data-dir=(\S+)/);
-    if (dirMatch && dirMatch[1] && path2.resolve(dirMatch[1]).startsWith(prefix)) {
+    if (dirMatch && dirMatch[1] && path3.resolve(dirMatch[1]).startsWith(prefix)) {
       profiles.add(dirMatch[1]);
     }
   }
@@ -1745,6 +1911,8 @@ var Browser = class {
   debuggingPort = null;
   /** Set when the Chrome child exits on its own; drives `windowOpen`. */
   closedAt = null;
+  /** The executable the last launch resolved and used; diagnostics only. */
+  chromeInUse = null;
   /** True while an observed/intentional close is tearing Chrome down. */
   quitting = false;
   /** The in-flight teardown, so a second close (or stop) joins it instead of racing. */
@@ -1785,17 +1953,20 @@ var Browser = class {
     if (!isWebSafeUrl(this.requestedUrl)) {
       throw new Error("launch() needs a web-safe --app URL");
     }
+    const chromeBin = findChrome();
+    if (!chromeBin.ok) throw new Error(chromeBin.error);
     this.viewer = await startViewerServer({ url: this.requestedUrl, pages: [], viewport: this.viewport() });
     const url = this.viewer.url;
     this.launchUrl = url;
-    const profile = await fs2.mkdtemp(path2.join(tmpdir(), "ds-chrome-"));
+    const profile = await fs2.mkdtemp(path3.join(tmpdir(), "ds-chrome-"));
     this.profileDir = profile;
-    const chrome = spawn(CHROME_PATH, buildLaunchArgs(this.windowSpec, profile, url), {
+    const chrome = spawn(chromeBin.path, buildLaunchArgs(this.windowSpec, profile, url), {
       stdio: "ignore",
       detached: true
     });
     chrome.unref();
     this.chrome = chrome;
+    this.chromeInUse = { path: chromeBin.path, source: chromeBin.source };
     chrome.on("exit", () => {
       if (this.chrome !== chrome) return;
       this.closedAt = Date.now();
@@ -1850,7 +2021,7 @@ var Browser = class {
     return true;
   }
   async waitForPort(profile, chrome) {
-    const file = path2.join(profile, "DevToolsActivePort");
+    const file = path3.join(profile, "DevToolsActivePort");
     const deadline = Date.now() + LAUNCH_TIMEOUT_MS;
     while (Date.now() < deadline) {
       if (chrome.exitCode !== null) throw new Error(`Chrome exited early (${chrome.exitCode})`);
@@ -2568,7 +2739,8 @@ var Browser = class {
       title,
       lastPick: this.lastPick,
       pickSeq: this.pickSeq,
-      windowOpen: this.closedAt === null && (this.chrome !== null || this.cdp !== null)
+      windowOpen: this.closedAt === null && (this.chrome !== null || this.cdp !== null),
+      chrome: this.chromeInUse
     };
   }
   /**
@@ -2739,7 +2911,7 @@ var SERVER_STATE_FILE = "server.json";
 var activeSpawns = /* @__PURE__ */ new Map();
 var serverRecords = /* @__PURE__ */ new Map();
 function serverStatePath(dir) {
-  return path3.join(dir, SERVER_STATE_DIR, SERVER_STATE_FILE);
+  return path4.join(dir, SERVER_STATE_DIR, SERVER_STATE_FILE);
 }
 async function readServerRecord(dir) {
   try {
@@ -2761,7 +2933,7 @@ async function readServerRecord(dir) {
 async function writeServerRecord(dir, record) {
   serverRecords.set(dir, record);
   try {
-    await fs3.mkdir(path3.join(dir, SERVER_STATE_DIR), { recursive: true });
+    await fs3.mkdir(path4.join(dir, SERVER_STATE_DIR), { recursive: true });
     await fs3.writeFile(serverStatePath(dir), JSON.stringify(record), "utf8");
   } catch {
   }
@@ -2880,7 +3052,7 @@ async function waitForPortFree(port, timeoutMs) {
   return canBindPort(port);
 }
 async function stopDevServer(dir) {
-  const key = path3.resolve(dir);
+  const key = path4.resolve(dir);
   const record = serverRecords.get(key) ?? await readServerRecord(key);
   if (!record) return { stopped: false };
   const stoppedPgid = record.pgid;
@@ -2908,7 +3080,7 @@ async function stopDevServer(dir) {
   return { stopped: true };
 }
 async function getDevServerStatus(dir) {
-  const key = path3.resolve(dir);
+  const key = path4.resolve(dir);
   const record = serverRecords.get(key) ?? await readServerRecord(key);
   if (!record) {
     const { config } = await readStudioConfig(key);
@@ -2970,7 +3142,7 @@ async function ensureDevServer(url, options = {}) {
       error: "the dev server is not running and no project directory was provided to start it"
     };
   }
-  const key = path3.resolve(dir);
+  const key = path4.resolve(dir);
   const inFlight = activeSpawns.get(key);
   if (inFlight) {
     const joined = await inFlight;
@@ -3069,7 +3241,7 @@ async function startAndWait(command, dir, url, timeoutMs) {
       await delay2(50);
       identity = await readProcessIdentity(pid);
     }
-    await writeServerRecord(path3.resolve(dir), {
+    await writeServerRecord(path4.resolve(dir), {
       pgid: pid,
       pid,
       port: portFromUrl(url),
@@ -3167,7 +3339,7 @@ function newBridgeToken() {
 }
 
 // service/browser-control.ts
-import path5 from "node:path";
+import path6 from "node:path";
 
 // node_modules/@openchamber/sdk/dist/scrollbar-style.js
 var GUEST_SCROLLING_ATTRIBUTE = "data-oc-scrolling";
@@ -3810,7 +3982,7 @@ function runGateReport(probe, ctx = {}) {
 
 // service/verify.ts
 import { promises as fs4 } from "node:fs";
-import path4 from "node:path";
+import path5 from "node:path";
 var DEFAULT_DEADLINE_MS = 10 * 6e4;
 var MAX_ITERATIONS = 40;
 var SOURCE_EXT = /* @__PURE__ */ new Set([
@@ -3851,19 +4023,19 @@ async function walkSources(root, dir, out) {
   for (const entry of entries) {
     if (out.length >= MAX_FILES) return;
     if (entry.name.startsWith(".")) continue;
-    const abs = path4.join(dir, entry.name);
+    const abs = path5.join(dir, entry.name);
     if (entry.isDirectory()) {
       if (SKIP_DIRS.has(entry.name)) continue;
       await walkSources(root, abs, out);
       continue;
     }
     if (!entry.isFile()) continue;
-    if (!SOURCE_EXT.has(path4.extname(entry.name).toLowerCase())) continue;
+    if (!SOURCE_EXT.has(path5.extname(entry.name).toLowerCase())) continue;
     try {
       const stat = await fs4.stat(abs);
       if (stat.size > MAX_FILE_BYTES) continue;
       const text = await fs4.readFile(abs, "utf8");
-      out.push({ path: path4.relative(root, abs).split(path4.sep).join("/"), text });
+      out.push({ path: path5.relative(root, abs).split(path5.sep).join("/"), text });
     } catch {
     }
   }
@@ -3881,7 +4053,7 @@ async function gatherGateContext(dir) {
   }
   let tokens = {};
   try {
-    tokens = parseTokens(await fs4.readFile(path4.join(dir, "tokens.css"), "utf8"));
+    tokens = parseTokens(await fs4.readFile(path5.join(dir, "tokens.css"), "utf8"));
   } catch {
   }
   return { files: bounded, tokens };
@@ -3969,7 +4141,7 @@ function providerVerificationFromReport(report) {
 }
 async function runVerification(opts) {
   const dir = opts.dir;
-  if (dir !== null && !path4.isAbsolute(dir)) throw new Error("dir must be an absolute project path");
+  if (dir !== null && !path5.isAbsolute(dir)) throw new Error("dir must be an absolute project path");
   let matrix = opts.viewports && opts.viewports.length ? VIEWPORTS.filter((v) => opts.viewports.includes(v.id)) : [...VIEWPORTS];
   if (matrix.length === 0) matrix = [...VIEWPORTS];
   const maxIterations = opts.maxIterations ?? MAX_ITERATIONS;
@@ -4110,7 +4282,7 @@ function viewportToken(summary) {
 }
 function projectDir(context) {
   const dir = context.directory;
-  return dir && path5.isAbsolute(dir) ? dir : null;
+  return dir && path6.isAbsolute(dir) ? dir : null;
 }
 function requireSelector(value, action) {
   if (!value || !value.trim()) {
@@ -4487,7 +4659,7 @@ async function handleBrowserControl(_req, body) {
 }
 
 // service/verify-routes.ts
-import path6 from "node:path";
+import path7 from "node:path";
 var MAX_BODY_BYTES = 1e6;
 function sendJson(res, status, body) {
   const text = JSON.stringify(body);
@@ -4531,7 +4703,7 @@ async function handleRun(req, res) {
   }
   const dir = body.dir;
   const url = body.url;
-  if (typeof dir !== "string" || !path6.isAbsolute(dir)) {
+  if (typeof dir !== "string" || !path7.isAbsolute(dir)) {
     sendJson(res, 400, { error: "dir must be an absolute project path" });
     return;
   }
@@ -4570,7 +4742,7 @@ async function handleVerifyRequest(req, res) {
 
 // service/harness-plugin.ts
 import { promises as fs5 } from "node:fs";
-import path7 from "node:path";
+import path8 from "node:path";
 
 // shared/harness-text.ts
 var CRAFT_RULES = {
@@ -4790,9 +4962,9 @@ function harnessPluginSource() {
   ].join("\n");
 }
 async function writeHarnessPlugin(projectDir2) {
-  const rootAbs = path7.resolve(projectDir2);
-  const abs = path7.resolve(rootAbs, HARNESS_PLUGIN_REL);
-  if (abs !== rootAbs && !abs.startsWith(rootAbs + path7.sep)) {
+  const rootAbs = path8.resolve(projectDir2);
+  const abs = path8.resolve(rootAbs, HARNESS_PLUGIN_REL);
+  if (abs !== rootAbs && !abs.startsWith(rootAbs + path8.sep)) {
     throw new Error("path outside project");
   }
   const source = harnessPluginSource();
@@ -4812,17 +4984,17 @@ async function writeHarnessPlugin(projectDir2) {
     await fs5.writeFile(abs, source, "utf8");
     return { path: HARNESS_PLUGIN_REL, created: false, updated: true, changed: true };
   }
-  await fs5.mkdir(path7.dirname(abs), { recursive: true });
+  await fs5.mkdir(path8.dirname(abs), { recursive: true });
   await fs5.writeFile(abs, source, "utf8");
   return { path: HARNESS_PLUGIN_REL, created: true, updated: false, changed: true };
 }
 
 // service/project-files.ts
-import { promises as fs6, constants } from "node:fs";
-import path8 from "node:path";
+import { promises as fs6, constants as constants2 } from "node:fs";
+import path9 from "node:path";
 async function resolveReferencePath(dir, input) {
   const controls = /[\u0000-\u001f\u007f-\u009f]/;
-  if (typeof dir !== "string" || !path8.isAbsolute(dir) || controls.test(dir)) {
+  if (typeof dir !== "string" || !path9.isAbsolute(dir) || controls.test(dir)) {
     throw new Error("Source directory must be a valid absolute project path. Select a project and try again.");
   }
   if (typeof input !== "string" || input.trim() === "") {
@@ -4838,12 +5010,12 @@ async function resolveReferencePath(dir, input) {
   } catch {
     throw new Error("Source project directory is not accessible. Select an accessible project and try again.");
   }
-  const absolute = path8.isAbsolute(input);
+  const absolute = path9.isAbsolute(input);
   const inside = (target) => {
-    const relative = path8.relative(sourceDirectory, target);
-    return relative !== ".." && !relative.startsWith(".." + path8.sep) && !path8.isAbsolute(relative);
+    const relative = path9.relative(sourceDirectory, target);
+    return relative !== ".." && !relative.startsWith(".." + path9.sep) && !path9.isAbsolute(relative);
   };
-  const candidate = path8.resolve(sourceDirectory, input);
+  const candidate = path9.resolve(sourceDirectory, input);
   if (!absolute && !inside(candidate)) {
     throw new Error("Relative file path is outside the source project. Paste its absolute path to select an external file.");
   }
@@ -4866,7 +5038,7 @@ async function resolveReferencePath(dir, input) {
     throw new Error("File is not accessible. Check the pasted path and its permissions.");
   }
   try {
-    await fs6.access(canonical, constants.R_OK);
+    await fs6.access(canonical, constants2.R_OK);
   } catch {
     throw new Error("File is not readable. Check its permissions or paste another file path.");
   }
@@ -4879,17 +5051,17 @@ function shouldSkipDir(name) {
   return name.startsWith(".") || SKIP_DIRS2.has(name);
 }
 function isInside(root, target) {
-  return target === root || target.startsWith(root + path8.sep);
+  return target === root || target.startsWith(root + path9.sep);
 }
 async function listProjectFiles(dir, limit) {
-  if (typeof dir !== "string" || !path8.isAbsolute(dir)) {
+  if (typeof dir !== "string" || !path9.isAbsolute(dir)) {
     throw new Error("dir must be an absolute path");
   }
   if (limit !== void 0 && (!Number.isInteger(limit) || limit < 1)) {
     throw new Error("limit must be a positive integer");
   }
   const cap = Math.min(limit ?? DEFAULT_FILE_LIMIT, MAX_FILE_LIMIT);
-  const rootAbs = path8.resolve(dir);
+  const rootAbs = path9.resolve(dir);
   const rootReal = await fs6.realpath(rootAbs);
   const found = [];
   const visitedDirs = /* @__PURE__ */ new Set([rootReal]);
@@ -4904,7 +5076,7 @@ async function listProjectFiles(dir, limit) {
     entries.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
     for (const entry of entries) {
       if (found.length >= cap) return;
-      const abs = path8.join(absDir, entry.name);
+      const abs = path9.join(absDir, entry.name);
       if (entry.isSymbolicLink()) {
         let real;
         try {
@@ -4924,7 +5096,7 @@ async function listProjectFiles(dir, limit) {
           visitedDirs.add(real);
           await walk(abs);
         } else if (stat.isFile()) {
-          found.push(path8.relative(rootAbs, abs));
+          found.push(path9.relative(rootAbs, abs));
         }
         continue;
       }
@@ -4932,18 +5104,18 @@ async function listProjectFiles(dir, limit) {
         if (shouldSkipDir(entry.name)) continue;
         await walk(abs);
       } else if (entry.isFile()) {
-        found.push(path8.relative(rootAbs, abs));
+        found.push(path9.relative(rootAbs, abs));
       }
     }
   };
   await walk(rootAbs);
-  return found.map((rel) => rel.split(path8.sep).join("/")).sort((a, b) => a < b ? -1 : a > b ? 1 : 0).slice(0, cap);
+  return found.map((rel) => rel.split(path9.sep).join("/")).sort((a, b) => a < b ? -1 : a > b ? 1 : 0).slice(0, cap);
 }
 
 // service/scaffold.ts
 import { spawn as spawn3 } from "node:child_process";
 import { promises as fs7 } from "node:fs";
-import path9 from "node:path";
+import path10 from "node:path";
 
 // shared/design-systems.ts
 var DESIGN_SYSTEMS = [
@@ -6400,7 +6572,7 @@ async function findFreePort(start, end, offset) {
   return null;
 }
 function projectName(dir) {
-  const base = path9.basename(path9.resolve(dir)).toLowerCase();
+  const base = path10.basename(path10.resolve(dir)).toLowerCase();
   const slug = base.replace(/[^a-z0-9._-]+/g, "-").replace(/^[-._]+|[-._]+$/g, "");
   if (!slug) return "design-project";
   return /^[a-z0-9]/.test(slug) ? slug : `design-${slug}`;
@@ -6703,7 +6875,7 @@ ${AUTHORITY_STATEMENT}`;
 }
 async function scaffoldProject(options) {
   const dir = options.dir;
-  if (!path9.isAbsolute(dir)) return { ok: false, error: "dir must be an absolute path" };
+  if (!path10.isAbsolute(dir)) return { ok: false, error: "dir must be an absolute path" };
   if (typeof options.type !== "string" || options.type.trim() === "") {
     return { ok: false, error: "type must be a non-empty string" };
   }
@@ -6746,7 +6918,7 @@ async function scaffoldProject(options) {
   ];
   const written = [];
   try {
-    await fs7.writeFile(path9.join(dir, DEFAULT_CONFIG_PATH), `${JSON.stringify(config, null, 2)}
+    await fs7.writeFile(path10.join(dir, DEFAULT_CONFIG_PATH), `${JSON.stringify(config, null, 2)}
 `, "utf8");
     written.push(DEFAULT_CONFIG_PATH);
   } catch (error) {
@@ -6754,7 +6926,7 @@ async function scaffoldProject(options) {
   }
   try {
     for (const [rel, content] of files) {
-      await fs7.writeFile(path9.join(dir, rel), content, "utf8");
+      await fs7.writeFile(path10.join(dir, rel), content, "utf8");
       written.push(rel);
     }
   } catch (error) {
@@ -6767,7 +6939,7 @@ async function scaffoldProject(options) {
     return { ok: false, error: error instanceof Error ? error.message : "could not write harness plugin" };
   }
   if (options.install !== false) {
-    const hasModules = await fs7.stat(path9.join(dir, "node_modules")).then((s) => s.isDirectory()).catch(() => false);
+    const hasModules = await fs7.stat(path10.join(dir, "node_modules")).then((s) => s.isDirectory()).catch(() => false);
     if (!hasModules) {
       const installed = await runNpmInstall(dir);
       if (!installed.ok) return { ok: false, error: installed.error };
@@ -6842,9 +7014,9 @@ async function readBody2(req) {
   return Buffer.concat(chunks).toString("utf8");
 }
 async function requireFile(root, rel) {
-  const abs = path10.resolve(root, rel);
-  const rootAbs = path10.resolve(root);
-  if (abs !== rootAbs && !abs.startsWith(rootAbs + path10.sep)) return null;
+  const abs = path11.resolve(root, rel);
+  const rootAbs = path11.resolve(root);
+  if (abs !== rootAbs && !abs.startsWith(rootAbs + path11.sep)) return null;
   try {
     const stat = await fs8.stat(abs);
     return stat.isFile() ? abs : null;
@@ -6863,7 +7035,7 @@ async function newestMtime(dir, entryAbs) {
     for (const entry of names) {
       if (!entry.isFile()) continue;
       try {
-        const stat = await fs8.stat(path10.join(dir, entry.name));
+        const stat = await fs8.stat(path11.join(dir, entry.name));
         if (stat.mtimeMs > newest) newest = stat.mtimeMs;
       } catch {
       }
@@ -6904,7 +7076,7 @@ var server = http.createServer(async (req, res) => {
         return;
       }
       const dir = parsed?.dir;
-      if (typeof dir !== "string" || !path10.isAbsolute(dir)) {
+      if (typeof dir !== "string" || !path11.isAbsolute(dir)) {
         sendJson2(res, 400, { error: "dir must be an absolute project path" });
         return;
       }
@@ -6953,7 +7125,7 @@ var server = http.createServer(async (req, res) => {
       }
       const body = parsed;
       const dir = body?.dir;
-      if (typeof dir !== "string" || !path10.isAbsolute(dir)) {
+      if (typeof dir !== "string" || !path11.isAbsolute(dir)) {
         sendJson2(res, 400, { error: "dir must be an absolute project path" });
         return;
       }
@@ -6984,7 +7156,7 @@ var server = http.createServer(async (req, res) => {
       const body = parsed;
       const dir = body?.dir;
       const type = body?.type;
-      if (typeof dir !== "string" || !path10.isAbsolute(dir)) {
+      if (typeof dir !== "string" || !path11.isAbsolute(dir)) {
         sendJson2(res, 400, { error: "dir must be an absolute project path" });
         return;
       }
@@ -7024,7 +7196,7 @@ var server = http.createServer(async (req, res) => {
         return;
       }
       const dir = parsed?.dir;
-      if (typeof dir !== "string" || !path10.isAbsolute(dir)) {
+      if (typeof dir !== "string" || !path11.isAbsolute(dir)) {
         sendJson2(res, 400, { error: "dir must be an absolute project path" });
         return;
       }
@@ -7068,7 +7240,7 @@ var server = http.createServer(async (req, res) => {
         return;
       }
       const dir = parsed?.dir;
-      if (typeof dir !== "string" || !path10.isAbsolute(dir)) {
+      if (typeof dir !== "string" || !path11.isAbsolute(dir)) {
         sendJson2(res, 400, { error: "dir must be an absolute project path" });
         return;
       }
@@ -7086,7 +7258,7 @@ var server = http.createServer(async (req, res) => {
     }
     if (url.pathname === "/server/status") {
       const dir = params.get("dir") ?? "";
-      if (!path10.isAbsolute(dir)) {
+      if (!path11.isAbsolute(dir)) {
         sendJson2(res, 400, { error: "dir must be absolute" });
         return;
       }
@@ -7105,7 +7277,7 @@ var server = http.createServer(async (req, res) => {
     if (url.pathname === "/stat") {
       const root = params.get("dir") ?? "";
       const entry = params.get("path") ?? "";
-      if (!path10.isAbsolute(root)) {
+      if (!path11.isAbsolute(root)) {
         sendJson2(res, 400, { error: "dir must be absolute" });
         return;
       }
@@ -7114,14 +7286,22 @@ var server = http.createServer(async (req, res) => {
         sendJson2(res, 404, { error: "entry not found" });
         return;
       }
-      const dir = path10.dirname(abs);
+      const dir = path11.dirname(abs);
       sendJson2(res, 200, { mtime: await newestMtime(dir, abs) });
       return;
     }
     if (url.pathname === "/state") {
       const target = getBrowser();
       if (!target) {
-        sendJson2(res, 200, { url: "", title: "", lastPick: null, pickSeq: 0, windowOpen: false, bridgeActive: bridge.active() });
+        sendJson2(res, 200, {
+          url: "",
+          title: "",
+          lastPick: null,
+          pickSeq: 0,
+          windowOpen: false,
+          chrome: null,
+          bridgeActive: bridge.active()
+        });
         return;
       }
       const state = await target.state();
@@ -7170,7 +7350,7 @@ var server = http.createServer(async (req, res) => {
         return;
       }
       const dir = typeof body?.dir === "string" && body.dir !== "" ? body.dir : null;
-      if (dir && !path10.isAbsolute(dir)) {
+      if (dir && !path11.isAbsolute(dir)) {
         sendJson2(res, 400, { error: "dir must be absolute" });
         return;
       }
@@ -7252,7 +7432,7 @@ var server = http.createServer(async (req, res) => {
     }
     if (url.pathname === "/config") {
       const root = params.get("dir") ?? "";
-      if (!path10.isAbsolute(root)) {
+      if (!path11.isAbsolute(root)) {
         sendJson2(res, 400, { error: "dir must be absolute" });
         return;
       }

@@ -70,6 +70,7 @@ test('service requires the bearer token and reports live-window state', async ()
       lastPick: unknown;
       pickSeq: number;
       windowOpen: boolean;
+      chrome: unknown;
       bridgeActive?: boolean;
     };
     assert.deepEqual(state, {
@@ -78,6 +79,7 @@ test('service requires the bearer token and reports live-window state', async ()
       lastPick: null,
       pickSeq: 0,
       windowOpen: false,
+      chrome: null,
       bridgeActive: false,
     });
 

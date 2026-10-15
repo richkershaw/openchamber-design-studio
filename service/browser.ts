@@ -20,13 +20,11 @@ import type { SurfaceInputEvent, SurfaceModifiers } from '@openchamber/sdk';
 
 import { PROBE_EXPR, PROBE_SCRIPT } from '../shared/probe-script.ts';
 import type { ProbeReport } from '../shared/verify-types.ts';
+import { findChrome, type ChromeSource } from './chrome-path.ts';
 import { startViewerServer } from './viewer-server.ts';
 import { ArtifactContexts } from './artifact-context.ts';
 import type { ShellAuthority, DefaultContext } from './artifact-context.ts';
 import type { ViewerPage } from './viewer-ui.ts';
-
-const CHROME_PATH =
-  process.env.DS_CHROME_PATH ?? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 
 const VIEWPORT_WIDTH = 1280;
 const VIEWPORT_HEIGHT = 800;
@@ -145,6 +143,13 @@ export type BrowserState = {
   pickSeq: number;
   /** True while the live Chrome window process is up; false once it has exited. */
   windowOpen: boolean;
+  /**
+   * The executable the last launch resolved, and which resolution step found it
+   * (env, config, PATH, or a platform default). Null until a window has been
+   * launched; kept after the window closes, so "which Chrome was that?" stays
+   * answerable.
+   */
+  chrome: { path: string; source: ChromeSource } | null;
 };
 
 // ProbeElement / ProbeReport are single-sourced in shared/verify-types.ts; the
@@ -895,6 +900,8 @@ export class Browser {
   private debuggingPort: number | null = null;
   /** Set when the Chrome child exits on its own; drives `windowOpen`. */
   private closedAt: number | null = null;
+  /** The executable the last launch resolved and used; diagnostics only. */
+  private chromeInUse: { path: string; source: ChromeSource } | null = null;
   /** True while an observed/intentional close is tearing Chrome down. */
   private quitting = false;
   /** The in-flight teardown, so a second close (or stop) joins it instead of racing. */
@@ -944,6 +951,11 @@ export class Browser {
     if (!isWebSafeUrl(this.requestedUrl)) {
       throw new Error('launch() needs a web-safe --app URL');
     }
+    // Resolve the browser BEFORE the viewer server starts: a machine with no
+    // Chrome must fail on the thing that is actually missing, rather than
+    // leaving a half-started viewer behind a "no window" state.
+    const chromeBin = findChrome();
+    if (!chromeBin.ok) throw new Error(chromeBin.error);
     this.viewer = await startViewerServer({url:this.requestedUrl,pages:[],viewport:this.viewport()});
     const url = this.viewer.url;
     this.launchUrl = url;
@@ -952,12 +964,13 @@ export class Browser {
 
     // Detached + unref: the window belongs to the user, not the service, so it
     // survives the service stopping/restarting (see stop()/stopBrowser()).
-    const chrome = spawn(CHROME_PATH, buildLaunchArgs(this.windowSpec, profile, url), {
+    const chrome = spawn(chromeBin.path, buildLaunchArgs(this.windowSpec, profile, url), {
       stdio: 'ignore',
       detached: true,
     });
     chrome.unref();
     this.chrome = chrome;
+    this.chromeInUse = { path: chromeBin.path, source: chromeBin.source };
     chrome.on('exit', () => {
       // The child dying on its own = the live window is gone (user closed it,
       // or quit Chrome). stop() clears this.chrome before its own kill lands, so
@@ -1729,6 +1742,7 @@ export class Browser {
       lastPick: this.lastPick,
       pickSeq: this.pickSeq,
       windowOpen: this.closedAt === null && (this.chrome !== null || this.cdp !== null),
+      chrome: this.chromeInUse,
     };
   }
 

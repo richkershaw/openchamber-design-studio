@@ -64,9 +64,14 @@ Requirements:
 
 - **OpenChamber ≥ 2.2.0** (the manifest declares `engines.openchamber` as
   `>=2.2.0`).
-- **Google Chrome** installed (the local service launches it). The default path is
-  macOS `"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"`;
-  `DS_CHROME_PATH` overrides it.
+- **Chrome or Chromium** installed (the local service launches it). The extension
+  resolves the executable in this order: `DS_CHROME_PATH`; then `path` in
+  `$XDG_CONFIG_HOME/openchamber/design-studio/browser.json` (or
+  `~/.config/openchamber/design-studio/browser.json`); then `google-chrome`,
+  `chromium`, `chrome` and friends on `PATH`; then the usual install locations
+  for macOS, Linux and Windows. Prefer the config file over the environment
+  variable: OpenChamber passes an extension service only a fixed allowlist of
+  environment variables, so an exported `DS_CHROME_PATH` never reaches it.
 - Approval of the extension's local **service** permission, once.
 
 Working on the extension itself:
@@ -189,9 +194,9 @@ project it is pointed at.
   running OpenChamber build is older.
 - **Platform:** desktop and web only. VS Code and mobile mark the guest catalog
   `unsupported` and do not load the extension.
-- **Browser:** a local Google Chrome. The default launch path is the macOS app
-  bundle; set `DS_CHROME_PATH` to point at Chrome elsewhere. Other operating
-  systems are not claimed beyond that override.
+- **Browser:** a local Chrome or Chromium. macOS, Linux and Windows install
+  locations are all probed, and the executable can be named explicitly in
+  `browser.json` (see Requirements above).
 
 ## Development
 

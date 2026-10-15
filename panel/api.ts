@@ -70,6 +70,12 @@ export type LiveState = {
   pickSeq: number;
   windowOpen: boolean;
   /**
+   * The browser executable the last launch resolved, and where it was found
+   * (env | config | path | default). Null before the first launch; diagnostics
+   * only, so the panel may ignore it.
+   */
+  chrome?: { path: string; source: string } | null;
+  /**
    * Another panel (the hidden pane `/design` mounts inside a chat window) is
    * the pick→chat bridge right now: this panel must not attach picks too.
    */

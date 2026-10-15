@@ -398,7 +398,17 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/state') {
       const target = getBrowser();
       if (!target) {
-        sendJson(res, 200, { url: '', title: '', lastPick: null, pickSeq: 0, windowOpen: false, bridgeActive: bridge.active() });
+        // The same shape Browser.state() reports, so a consumer sees one /state
+        // payload whatever stage the service is at.
+        sendJson(res, 200, {
+          url: '',
+          title: '',
+          lastPick: null,
+          pickSeq: 0,
+          windowOpen: false,
+          chrome: null,
+          bridgeActive: bridge.active(),
+        });
         return;
       }
       const state = (await target.state()) as { bridgeActive?: boolean };
