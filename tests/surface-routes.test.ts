@@ -85,9 +85,9 @@ test('the surface routes answer the host contract with no browser running', asyn
     assert.equal((await post('/surface/resize', JSON.stringify({ width: 900, height: 600 }))).status, 400);
     assert.equal((await post('/surface/resize', JSON.stringify({ width: 'wide' }))).status, 400);
 
-    // Clipboard reads are not implemented, and a non-200 tells the host to say so
-    // rather than overwrite the viewer's clipboard.
-    assert.equal((await fetch(`${base}/surface/clipboard`, { headers: auth })).status, 501);
+    // With nothing selected there is no text to copy, and a non-200 is what stops
+    // the host from wiping the viewer's clipboard with an empty string.
+    assert.equal((await fetch(`${base}/surface/clipboard`, { headers: auth })).status, 404);
 
     // Methods are pinned per route.
     const wrong = await post('/surface/frame', '');

@@ -69,7 +69,7 @@ export async function handleSurfaceRequest(
   }
   if (pathname === SURFACE_CLIPBOARD_PATH) {
     if (req.method !== 'GET') return methodNotAllowed(res, 'GET');
-    handleClipboard(res);
+    await handleClipboard(res);
     return true;
   }
   if (req.method !== 'POST') return methodNotAllowed(res, 'POST');
@@ -180,13 +180,23 @@ async function handleResize(req: IncomingMessage, res: ServerResponse): Promise<
 }
 
 /**
- * Text the viewer copied inside the surface. Reading the artifact frame's
- * selection needs the frame's own execution context, which this build does not
- * wire up yet; a non-200 tells the host to say so rather than overwrite the
- * viewer's clipboard with nothing.
+ * Text the viewer selected inside the surface, for the host to put on their
+ * clipboard. It is read live from the page under design (the artifact frame) and
+ * from the shell's own chrome as a fallback — most often the viewer pressed
+ * Cmd/Ctrl+C with that selection still up.
+ *
+ * Anything but a 200 means "no text", which the host reports to the viewer. That
+ * matters more than it looks: the host writes what we return straight onto their
+ * clipboard, so answering 200 with an empty string would silently wipe it.
  */
-function handleClipboard(res: ServerResponse): void {
-  sendJson(res, 501, { error: 'clipboard reads are not implemented yet' });
+async function handleClipboard(res: ServerResponse): Promise<void> {
+  const browser = getBrowser();
+  const text = browser ? await browser.selectionText() : '';
+  if (text.trim() === '') {
+    sendJson(res, 404, { error: 'nothing is selected in the live view' });
+    return;
+  }
+  sendJson(res, 200, { text });
 }
 
 function methodNotAllowed(res: ServerResponse, allow: string): boolean {

@@ -17,8 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   machine, a tunnel — because the host carries both directions itself and the
   service is only ever called on its own loopback. The pane's requested size is
   refused (`POST /surface/resize`): the design viewport stays the one the gates
-  judge. Reading text copied inside the surface is not implemented yet and answers
-  501 rather than overwriting the viewer's clipboard.
+  judge. Selecting text in the picture and copying it reads the selection out of
+  the page under design (`GET /surface/clipboard`); an empty selection answers
+  404 rather than emptying the viewer's clipboard.
 - **Attach to a browser over CDP.** `cdpEndpoint` in `browser.json` makes the
   service drive a browser it did not start — a sidecar container, another host, a
   broker — instead of launching one. The page it drives is a new target in that

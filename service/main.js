@@ -59,6 +59,255 @@ import { promises as fs2 } from "node:fs";
 import { tmpdir } from "node:os";
 import path3 from "node:path";
 
+// node_modules/@openchamber/sdk/dist/scrollbar-style.js
+var GUEST_SCROLLING_ATTRIBUTE = "data-oc-scrolling";
+var GUEST_SCROLLBAR_CSS = `
+:root {
+  --oc-scrollbar-thumb: color-mix(in srgb, var(--oc-muted, currentColor) 40%, transparent);
+  --oc-scrollbar-thumb-hover: color-mix(in srgb, var(--oc-muted, currentColor) 65%, transparent);
+  scrollbar-gutter: stable;
+}
+* {
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+}
+:hover, [${GUEST_SCROLLING_ATTRIBUTE}] {
+  scrollbar-color: var(--oc-scrollbar-thumb) transparent;
+}
+/* Chromium's standard scrollbar properties otherwise override its pseudo-elements. */
+@supports selector(::-webkit-scrollbar) {
+  *, :hover, [${GUEST_SCROLLING_ATTRIBUTE}] { scrollbar-width: auto; scrollbar-color: auto; }
+  ::-webkit-scrollbar { width: 6px; height: 6px; background: transparent; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb {
+    background: transparent;
+    border-radius: 999px;
+    min-width: 24px;
+    min-height: 24px;
+  }
+  :hover::-webkit-scrollbar-thumb, [${GUEST_SCROLLING_ATTRIBUTE}]::-webkit-scrollbar-thumb { background: var(--oc-scrollbar-thumb); }
+  ::-webkit-scrollbar-thumb:hover { background: var(--oc-scrollbar-thumb-hover); }
+  ::-webkit-scrollbar-corner { background: transparent; }
+  ::-webkit-scrollbar-button { display: none; width: 0; height: 0; }
+}
+@media (forced-colors: active) {
+  *, :hover, [${GUEST_SCROLLING_ATTRIBUTE}] { scrollbar-color: auto; }
+  ::-webkit-scrollbar-thumb, ::-webkit-scrollbar-thumb:hover { background: CanvasText; }
+}
+`;
+function installGuestScrollbarActivity(doc) {
+  const root = doc.documentElement;
+  if (root.hasAttribute("data-oc-scrollbar-activity"))
+    return;
+  root.setAttribute("data-oc-scrollbar-activity", "");
+  const timers = /* @__PURE__ */ new WeakMap();
+  doc.addEventListener("scroll", (event) => {
+    const target = event.target === doc ? root : event.target;
+    if (!(target instanceof Element))
+      return;
+    if (!target.hasAttribute("data-oc-scrolling"))
+      target.setAttribute("data-oc-scrolling", "");
+    const pending = timers.get(target);
+    if (pending !== void 0)
+      clearTimeout(pending);
+    timers.set(target, setTimeout(() => {
+      timers.delete(target);
+      target.removeAttribute("data-oc-scrolling");
+    }, 1e3));
+  }, { capture: true, passive: true });
+}
+var GUEST_SCROLLBAR_SCRIPT = `(${installGuestScrollbarActivity.toString()})(document);`;
+
+// node_modules/@openchamber/sdk/dist/contract.js
+var GUEST_FILE_STAT_KINDS = ["file", "directory", "other", "missing"];
+var HOST_REQUEST_ERROR_CODES = [
+  "HOST_UNAVAILABLE",
+  "HOST_TIMEOUT",
+  "HOST_REJECTED",
+  "DISCONNECTED",
+  "DISABLED",
+  "BAD_PATH",
+  "NO_INTEGRATION",
+  "NO_SERVICE",
+  "SERVICE_FAILED",
+  "NO_SESSION",
+  "SESSION_BUSY",
+  "NOT_GRANTED",
+  "NO_DIRECTORY",
+  "NOT_FOUND",
+  "FILE_TOO_LARGE",
+  "DENIED",
+  "NO_MODEL",
+  "MODEL_FAILED",
+  "UNSUPPORTED"
+];
+var SERVICE_STATUS_VALUES = ["stopped", "starting", "ready", "failed"];
+var hostRequestErrorCodeSet = new Set(HOST_REQUEST_ERROR_CODES);
+var serviceStatusSet = new Set(SERVICE_STATUS_VALUES);
+var fileStatKindSet = new Set(GUEST_FILE_STAT_KINDS);
+
+// node_modules/@openchamber/sdk/dist/service-providers.js
+var BROWSER_PROVIDER_PATH = "/browser-control";
+var BROWSER_CONTROL_ACTIONS = [
+  "browser.open",
+  "browser.snapshot",
+  "browser.click",
+  "browser.type",
+  "browser.scroll",
+  "browser.back",
+  "browser.forward",
+  "browser.inspect",
+  "browser.capture",
+  "browser.resize"
+];
+var BROWSER_VIEWPORT_MODES = ["mobile", "tablet", "desktop", "fill"];
+var BROWSER_PROVIDER_IDLE_MS = 10 * 6e4;
+var CONTROL_ACTIONS = new Set(BROWSER_CONTROL_ACTIONS);
+var isBrowserControlAction = (value) => CONTROL_ACTIONS.has(value);
+var readContext = (wire) => {
+  const directory = wire?.directory;
+  const sessionId = wire?.sessionId;
+  return {
+    directory: String(directory) === directory && directory.length > 0 ? directory : null,
+    sessionId: String(sessionId) === sessionId && sessionId.length > 0 ? sessionId : null
+  };
+};
+var readBrowserProviderRequest = (body) => {
+  let wire;
+  try {
+    const parsed = JSON.parse(body);
+    if (Object(parsed) !== parsed || parsed === null)
+      return null;
+    wire = parsed;
+  } catch {
+    return null;
+  }
+  const { requestId, action, parameters, context } = wire;
+  if (String(requestId) !== requestId || requestId.length === 0)
+    return null;
+  if (String(action) !== action || !isBrowserControlAction(action))
+    return null;
+  if (Object(parameters) !== parameters)
+    return null;
+  return { requestId, action, parameters, context: readContext(context) };
+};
+
+// node_modules/@openchamber/sdk/dist/service-surface.js
+var SURFACE_FRAME_PATH = "/surface/frame";
+var SURFACE_INPUT_PATH = "/surface/input";
+var SURFACE_CONTROL_PATH = "/surface/control";
+var SURFACE_RESIZE_PATH = "/surface/resize";
+var SURFACE_CLIPBOARD_PATH = "/surface/clipboard";
+var SURFACE_SEQ_HEADER = "x-surface-seq";
+var SURFACE_WIDTH_HEADER = "x-surface-width";
+var SURFACE_HEIGHT_HEADER = "x-surface-height";
+var SURFACE_AGENT_ACTIVE_HEADER = "x-surface-agent-active";
+var SURFACE_FRAME_SEQ_HEADER = "x-surface-frame-seq";
+var SURFACE_FRAME_WAIT_MS = 25e3;
+var SURFACE_FRAME_MAX_BYTES = 8e6;
+var SURFACE_INPUT_BATCH_MAX = 256;
+var SURFACE_TEXT_MAX = 64e3;
+var SURFACE_DIMENSION_MAX = 16384;
+var SURFACE_AGENT_HOLD_MS = 3e4;
+var SURFACE_CONTROLLERS = ["none", "agent", "user"];
+var isFiniteNumber = (value) => Number(value) === value && Number.isFinite(value);
+var isBool = (value) => value === true || value === false;
+var isText = (value) => String(value) === value;
+var readModifiers = (value) => {
+  if (Object(value) !== value || value === null)
+    return null;
+  const wire = value;
+  if (!isBool(wire.alt) || !isBool(wire.ctrl) || !isBool(wire.meta) || !isBool(wire.shift))
+    return null;
+  return { alt: wire.alt, ctrl: wire.ctrl, meta: wire.meta, shift: wire.shift };
+};
+var readEvent = (value) => {
+  if (value.type === "text") {
+    if (!isText(value.text) || value.text.length > SURFACE_TEXT_MAX)
+      return null;
+    return { type: "text", text: value.text };
+  }
+  const modifiers = readModifiers(value.modifiers);
+  if (!modifiers)
+    return null;
+  if (value.type === "pointer") {
+    if (value.action !== "down" && value.action !== "up" && value.action !== "move")
+      return null;
+    if (!isFiniteNumber(value.x) || !isFiniteNumber(value.y) || !isFiniteNumber(value.button) || !isFiniteNumber(value.buttons))
+      return null;
+    return { type: "pointer", action: value.action, x: value.x, y: value.y, button: value.button, buttons: value.buttons, modifiers };
+  }
+  if (value.type === "wheel") {
+    if (!isFiniteNumber(value.x) || !isFiniteNumber(value.y) || !isFiniteNumber(value.deltaX) || !isFiniteNumber(value.deltaY))
+      return null;
+    return { type: "wheel", x: value.x, y: value.y, deltaX: value.deltaX, deltaY: value.deltaY, modifiers };
+  }
+  if (value.type === "key") {
+    if (value.action !== "down" && value.action !== "up")
+      return null;
+    if (!isText(value.key) || !isText(value.code) || value.key.length > 64 || value.code.length > 64)
+      return null;
+    return { type: "key", action: value.action, key: value.key, code: value.code, modifiers };
+  }
+  return null;
+};
+var readSurfaceInputBatch = (body) => {
+  let parsed;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return null;
+  }
+  if (Object(parsed) !== parsed || parsed === null || !Array.isArray(parsed.events))
+    return null;
+  if (parsed.events.length > SURFACE_INPUT_BATCH_MAX)
+    return null;
+  const events = [];
+  for (const item of parsed.events) {
+    if (Object(item) !== item || item === null)
+      return null;
+    const event = readEvent(item);
+    if (!event)
+      return null;
+    events.push(event);
+  }
+  return { events };
+};
+var CONTROLLERS = new Set(SURFACE_CONTROLLERS);
+var readSurfaceControlNotice = (body) => {
+  let parsed;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return null;
+  }
+  if (Object(parsed) !== parsed || parsed === null)
+    return null;
+  const { controller, viewer } = parsed;
+  if (!isText(controller) || !CONTROLLERS.has(controller))
+    return null;
+  const notice = { controller };
+  if (controller === "user" && isText(viewer) && viewer.length > 0)
+    notice.viewer = viewer;
+  return notice;
+};
+var readSurfaceResizeRequest = (body) => {
+  let parsed;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return null;
+  }
+  if (Object(parsed) !== parsed || parsed === null)
+    return null;
+  const { width, height } = parsed;
+  if (!isFiniteNumber(width) || !isFiniteNumber(height))
+    return null;
+  if (width < 1 || height < 1 || width > SURFACE_DIMENSION_MAX || height > SURFACE_DIMENSION_MAX)
+    return null;
+  return { width: Math.round(width), height: Math.round(height) };
+};
+
 // shared/probe-script.ts
 var PROBE_SCRIPT = String.raw`(function () {
   'use strict';
@@ -2996,6 +3245,27 @@ var Browser = class {
     return this.frames.next(after, waitMs);
   }
   /**
+   * The text selected in the live view, for the surface's clipboard read: the
+   * artifact frame first — that is where a person selects text to copy, the page
+   * under design itself — and the shell's own chrome second. Empty means nothing
+   * is selected, which the route reports as "nothing to copy" rather than as empty
+   * text, because the host writes whatever we return onto the viewer's clipboard.
+   */
+  async selectionText() {
+    if (!this.cdp || !this.sessionId) return "";
+    const read = async (shell) => {
+      try {
+        const expression = 'String(window.getSelection() || "")';
+        const value = shell ? await this.shellEval(expression) : await this.evalIn(expression, false);
+        return typeof value === "string" ? value.slice(0, SURFACE_TEXT_MAX) : "";
+      } catch {
+        return "";
+      }
+    };
+    const artifact = await read(false);
+    return artifact.trim() !== "" ? artifact : read(true);
+  }
+  /**
    * Stop pushing frames once nobody has asked for a while. A pane that closes
    * leaves the screencast running otherwise, and a page that animates would keep
    * Chrome painting a picture no one is watching. The picture is dropped with it;
@@ -3635,255 +3905,6 @@ async function startAndWait(command, dir, url, timeoutMs) {
     error: `the command started but ${url} never came up within ${Math.round(timeoutMs / 1e3)}s`
   };
 }
-
-// node_modules/@openchamber/sdk/dist/scrollbar-style.js
-var GUEST_SCROLLING_ATTRIBUTE = "data-oc-scrolling";
-var GUEST_SCROLLBAR_CSS = `
-:root {
-  --oc-scrollbar-thumb: color-mix(in srgb, var(--oc-muted, currentColor) 40%, transparent);
-  --oc-scrollbar-thumb-hover: color-mix(in srgb, var(--oc-muted, currentColor) 65%, transparent);
-  scrollbar-gutter: stable;
-}
-* {
-  scrollbar-width: thin;
-  scrollbar-color: transparent transparent;
-}
-:hover, [${GUEST_SCROLLING_ATTRIBUTE}] {
-  scrollbar-color: var(--oc-scrollbar-thumb) transparent;
-}
-/* Chromium's standard scrollbar properties otherwise override its pseudo-elements. */
-@supports selector(::-webkit-scrollbar) {
-  *, :hover, [${GUEST_SCROLLING_ATTRIBUTE}] { scrollbar-width: auto; scrollbar-color: auto; }
-  ::-webkit-scrollbar { width: 6px; height: 6px; background: transparent; }
-  ::-webkit-scrollbar-track { background: transparent; }
-  ::-webkit-scrollbar-thumb {
-    background: transparent;
-    border-radius: 999px;
-    min-width: 24px;
-    min-height: 24px;
-  }
-  :hover::-webkit-scrollbar-thumb, [${GUEST_SCROLLING_ATTRIBUTE}]::-webkit-scrollbar-thumb { background: var(--oc-scrollbar-thumb); }
-  ::-webkit-scrollbar-thumb:hover { background: var(--oc-scrollbar-thumb-hover); }
-  ::-webkit-scrollbar-corner { background: transparent; }
-  ::-webkit-scrollbar-button { display: none; width: 0; height: 0; }
-}
-@media (forced-colors: active) {
-  *, :hover, [${GUEST_SCROLLING_ATTRIBUTE}] { scrollbar-color: auto; }
-  ::-webkit-scrollbar-thumb, ::-webkit-scrollbar-thumb:hover { background: CanvasText; }
-}
-`;
-function installGuestScrollbarActivity(doc) {
-  const root = doc.documentElement;
-  if (root.hasAttribute("data-oc-scrollbar-activity"))
-    return;
-  root.setAttribute("data-oc-scrollbar-activity", "");
-  const timers = /* @__PURE__ */ new WeakMap();
-  doc.addEventListener("scroll", (event) => {
-    const target = event.target === doc ? root : event.target;
-    if (!(target instanceof Element))
-      return;
-    if (!target.hasAttribute("data-oc-scrolling"))
-      target.setAttribute("data-oc-scrolling", "");
-    const pending = timers.get(target);
-    if (pending !== void 0)
-      clearTimeout(pending);
-    timers.set(target, setTimeout(() => {
-      timers.delete(target);
-      target.removeAttribute("data-oc-scrolling");
-    }, 1e3));
-  }, { capture: true, passive: true });
-}
-var GUEST_SCROLLBAR_SCRIPT = `(${installGuestScrollbarActivity.toString()})(document);`;
-
-// node_modules/@openchamber/sdk/dist/contract.js
-var GUEST_FILE_STAT_KINDS = ["file", "directory", "other", "missing"];
-var HOST_REQUEST_ERROR_CODES = [
-  "HOST_UNAVAILABLE",
-  "HOST_TIMEOUT",
-  "HOST_REJECTED",
-  "DISCONNECTED",
-  "DISABLED",
-  "BAD_PATH",
-  "NO_INTEGRATION",
-  "NO_SERVICE",
-  "SERVICE_FAILED",
-  "NO_SESSION",
-  "SESSION_BUSY",
-  "NOT_GRANTED",
-  "NO_DIRECTORY",
-  "NOT_FOUND",
-  "FILE_TOO_LARGE",
-  "DENIED",
-  "NO_MODEL",
-  "MODEL_FAILED",
-  "UNSUPPORTED"
-];
-var SERVICE_STATUS_VALUES = ["stopped", "starting", "ready", "failed"];
-var hostRequestErrorCodeSet = new Set(HOST_REQUEST_ERROR_CODES);
-var serviceStatusSet = new Set(SERVICE_STATUS_VALUES);
-var fileStatKindSet = new Set(GUEST_FILE_STAT_KINDS);
-
-// node_modules/@openchamber/sdk/dist/service-providers.js
-var BROWSER_PROVIDER_PATH = "/browser-control";
-var BROWSER_CONTROL_ACTIONS = [
-  "browser.open",
-  "browser.snapshot",
-  "browser.click",
-  "browser.type",
-  "browser.scroll",
-  "browser.back",
-  "browser.forward",
-  "browser.inspect",
-  "browser.capture",
-  "browser.resize"
-];
-var BROWSER_VIEWPORT_MODES = ["mobile", "tablet", "desktop", "fill"];
-var BROWSER_PROVIDER_IDLE_MS = 10 * 6e4;
-var CONTROL_ACTIONS = new Set(BROWSER_CONTROL_ACTIONS);
-var isBrowserControlAction = (value) => CONTROL_ACTIONS.has(value);
-var readContext = (wire) => {
-  const directory = wire?.directory;
-  const sessionId = wire?.sessionId;
-  return {
-    directory: String(directory) === directory && directory.length > 0 ? directory : null,
-    sessionId: String(sessionId) === sessionId && sessionId.length > 0 ? sessionId : null
-  };
-};
-var readBrowserProviderRequest = (body) => {
-  let wire;
-  try {
-    const parsed = JSON.parse(body);
-    if (Object(parsed) !== parsed || parsed === null)
-      return null;
-    wire = parsed;
-  } catch {
-    return null;
-  }
-  const { requestId, action, parameters, context } = wire;
-  if (String(requestId) !== requestId || requestId.length === 0)
-    return null;
-  if (String(action) !== action || !isBrowserControlAction(action))
-    return null;
-  if (Object(parameters) !== parameters)
-    return null;
-  return { requestId, action, parameters, context: readContext(context) };
-};
-
-// node_modules/@openchamber/sdk/dist/service-surface.js
-var SURFACE_FRAME_PATH = "/surface/frame";
-var SURFACE_INPUT_PATH = "/surface/input";
-var SURFACE_CONTROL_PATH = "/surface/control";
-var SURFACE_RESIZE_PATH = "/surface/resize";
-var SURFACE_CLIPBOARD_PATH = "/surface/clipboard";
-var SURFACE_SEQ_HEADER = "x-surface-seq";
-var SURFACE_WIDTH_HEADER = "x-surface-width";
-var SURFACE_HEIGHT_HEADER = "x-surface-height";
-var SURFACE_AGENT_ACTIVE_HEADER = "x-surface-agent-active";
-var SURFACE_FRAME_SEQ_HEADER = "x-surface-frame-seq";
-var SURFACE_FRAME_WAIT_MS = 25e3;
-var SURFACE_FRAME_MAX_BYTES = 8e6;
-var SURFACE_INPUT_BATCH_MAX = 256;
-var SURFACE_TEXT_MAX = 64e3;
-var SURFACE_DIMENSION_MAX = 16384;
-var SURFACE_AGENT_HOLD_MS = 3e4;
-var SURFACE_CONTROLLERS = ["none", "agent", "user"];
-var isFiniteNumber = (value) => Number(value) === value && Number.isFinite(value);
-var isBool = (value) => value === true || value === false;
-var isText = (value) => String(value) === value;
-var readModifiers = (value) => {
-  if (Object(value) !== value || value === null)
-    return null;
-  const wire = value;
-  if (!isBool(wire.alt) || !isBool(wire.ctrl) || !isBool(wire.meta) || !isBool(wire.shift))
-    return null;
-  return { alt: wire.alt, ctrl: wire.ctrl, meta: wire.meta, shift: wire.shift };
-};
-var readEvent = (value) => {
-  if (value.type === "text") {
-    if (!isText(value.text) || value.text.length > SURFACE_TEXT_MAX)
-      return null;
-    return { type: "text", text: value.text };
-  }
-  const modifiers = readModifiers(value.modifiers);
-  if (!modifiers)
-    return null;
-  if (value.type === "pointer") {
-    if (value.action !== "down" && value.action !== "up" && value.action !== "move")
-      return null;
-    if (!isFiniteNumber(value.x) || !isFiniteNumber(value.y) || !isFiniteNumber(value.button) || !isFiniteNumber(value.buttons))
-      return null;
-    return { type: "pointer", action: value.action, x: value.x, y: value.y, button: value.button, buttons: value.buttons, modifiers };
-  }
-  if (value.type === "wheel") {
-    if (!isFiniteNumber(value.x) || !isFiniteNumber(value.y) || !isFiniteNumber(value.deltaX) || !isFiniteNumber(value.deltaY))
-      return null;
-    return { type: "wheel", x: value.x, y: value.y, deltaX: value.deltaX, deltaY: value.deltaY, modifiers };
-  }
-  if (value.type === "key") {
-    if (value.action !== "down" && value.action !== "up")
-      return null;
-    if (!isText(value.key) || !isText(value.code) || value.key.length > 64 || value.code.length > 64)
-      return null;
-    return { type: "key", action: value.action, key: value.key, code: value.code, modifiers };
-  }
-  return null;
-};
-var readSurfaceInputBatch = (body) => {
-  let parsed;
-  try {
-    parsed = JSON.parse(body);
-  } catch {
-    return null;
-  }
-  if (Object(parsed) !== parsed || parsed === null || !Array.isArray(parsed.events))
-    return null;
-  if (parsed.events.length > SURFACE_INPUT_BATCH_MAX)
-    return null;
-  const events = [];
-  for (const item of parsed.events) {
-    if (Object(item) !== item || item === null)
-      return null;
-    const event = readEvent(item);
-    if (!event)
-      return null;
-    events.push(event);
-  }
-  return { events };
-};
-var CONTROLLERS = new Set(SURFACE_CONTROLLERS);
-var readSurfaceControlNotice = (body) => {
-  let parsed;
-  try {
-    parsed = JSON.parse(body);
-  } catch {
-    return null;
-  }
-  if (Object(parsed) !== parsed || parsed === null)
-    return null;
-  const { controller, viewer } = parsed;
-  if (!isText(controller) || !CONTROLLERS.has(controller))
-    return null;
-  const notice = { controller };
-  if (controller === "user" && isText(viewer) && viewer.length > 0)
-    notice.viewer = viewer;
-  return notice;
-};
-var readSurfaceResizeRequest = (body) => {
-  let parsed;
-  try {
-    parsed = JSON.parse(body);
-  } catch {
-    return null;
-  }
-  if (Object(parsed) !== parsed || parsed === null)
-    return null;
-  const { width, height } = parsed;
-  if (!isFiniteNumber(width) || !isFiniteNumber(height))
-    return null;
-  if (width < 1 || height < 1 || width > SURFACE_DIMENSION_MAX || height > SURFACE_DIMENSION_MAX)
-    return null;
-  return { width: Math.round(width), height: Math.round(height) };
-};
 
 // service/surface.ts
 var browser = null;
@@ -7499,7 +7520,7 @@ async function handleSurfaceRequest(req, res, url) {
   }
   if (pathname === SURFACE_CLIPBOARD_PATH) {
     if (req.method !== "GET") return methodNotAllowed(res, "GET");
-    handleClipboard(res);
+    await handleClipboard(res);
     return true;
   }
   if (req.method !== "POST") return methodNotAllowed(res, "POST");
@@ -7580,8 +7601,14 @@ async function handleResize2(req, res) {
   }
   sendJson2(res, 400, { error: "the design viewport is fixed; the picture is scaled to the pane" });
 }
-function handleClipboard(res) {
-  sendJson2(res, 501, { error: "clipboard reads are not implemented yet" });
+async function handleClipboard(res) {
+  const browser2 = getBrowser();
+  const text = browser2 ? await browser2.selectionText() : "";
+  if (text.trim() === "") {
+    sendJson2(res, 404, { error: "nothing is selected in the live view" });
+    return;
+  }
+  sendJson2(res, 200, { text });
 }
 function methodNotAllowed(res, allow) {
   res.writeHead(405, { allow, "cache-control": "no-store" });

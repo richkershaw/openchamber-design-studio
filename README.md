@@ -187,6 +187,11 @@ The pane can also send the size it would like (`POST /surface/resize`); this
 build keeps the design viewport it was given and scales the picture into the
 pane, so the width the gates judge and the width you see stay the same.
 
+Copying works the same way: select text in the picture, press ⌘/Ctrl+C, and the
+pane asks the service for the selection (`GET /surface/clipboard`), which it reads
+out of the page under design. With nothing selected the answer is a refusal, not
+empty text — the host puts whatever we return straight on your clipboard.
+
 ### Pick an element, get a chat reference
 
 Hold ⌘ (Ctrl on Windows/Linux) and click any element in the live view. The click

@@ -16,7 +16,7 @@ import { promises as fs } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
-import type { SurfaceInputEvent, SurfaceModifiers } from '@openchamber/sdk';
+import { SURFACE_TEXT_MAX, type SurfaceInputEvent, type SurfaceModifiers } from '@openchamber/sdk';
 
 import { PROBE_EXPR, PROBE_SCRIPT } from '../shared/probe-script.ts';
 import type { ProbeReport } from '../shared/verify-types.ts';
@@ -1946,6 +1946,29 @@ export class Browser {
     }
     this.scheduleFrameIdleStop();
     return this.frames.next(after, waitMs);
+  }
+
+  /**
+   * The text selected in the live view, for the surface's clipboard read: the
+   * artifact frame first — that is where a person selects text to copy, the page
+   * under design itself — and the shell's own chrome second. Empty means nothing
+   * is selected, which the route reports as "nothing to copy" rather than as empty
+   * text, because the host writes whatever we return onto the viewer's clipboard.
+   */
+  async selectionText(): Promise<string> {
+    if (!this.cdp || !this.sessionId) return '';
+    const read = async (shell: boolean): Promise<string> => {
+      try {
+        const expression = 'String(window.getSelection() || "")';
+        const value = shell ? await this.shellEval(expression) : await this.evalIn(expression, false);
+        return typeof value === 'string' ? value.slice(0, SURFACE_TEXT_MAX) : '';
+      } catch {
+        /* that context may not be up (or gone); the other one gets its chance */
+        return '';
+      }
+    };
+    const artifact = await read(false);
+    return artifact.trim() !== '' ? artifact : read(true);
   }
 
   /**
