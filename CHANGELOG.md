@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The window in the rail panel.** The service declares a shared surface, so
+  OpenChamber pulls viewport frames from it (`GET /surface/frame`) and posts the
+  viewer's pointer, wheel, key and text input back (`POST /surface/input`), with
+  `POST /surface/control` deciding whether the person or the agent is driving.
+  The preview therefore works wherever OpenChamber does — the desktop app, another
+  machine, a tunnel — because the host carries both directions itself and the
+  service is only ever called on its own loopback. The pane's requested size is
+  refused (`POST /surface/resize`): the design viewport stays the one the gates
+  judge. Reading text copied inside the surface is not implemented yet and answers
+  501 rather than overwriting the viewer's clipboard.
 - **Attach to a browser over CDP.** `cdpEndpoint` in `browser.json` makes the
   service drive a browser it did not start — a sidecar container, another host, a
   broker — instead of launching one. The page it drives is a new target in that

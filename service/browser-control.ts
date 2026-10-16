@@ -49,7 +49,7 @@ import {
   providerVerificationFromReport,
   runVerification,
 } from './verify.ts';
-import { ensureBrowser } from './surface.ts';
+import { ensureBrowser, noteAgentActivity } from './surface.ts';
 import type { Browser } from './browser.ts';
 
 const NO_MODIFIERS = { alt: false, ctrl: false, meta: false, shift: false };
@@ -583,6 +583,9 @@ export async function handleBrowserControl(
   }
 
   try {
+    // An agent action is what the surface's `x-surface-agent-active` flag is
+    // about: the host shows "the agent is working" on the pane while one runs.
+    noteAgentActivity();
     const browser = await ensureBrowser();
     const dir = projectDir(request.context);
 

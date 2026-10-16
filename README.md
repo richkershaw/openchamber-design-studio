@@ -151,25 +151,55 @@ sharing the service's network namespace:
 ```bash
 docker run -d --network container:openchamber \
   --entrypoint /path/to/chrome ghcr.io/browserless/chromium \
-  --headless=new --no-sandbox --remote-debugging-port=9222 --remote-debugging-address=0.0.0.0
+  --headless=new --no-sandbox --window-size=1280,800 \
+  --remote-debugging-port=9222 --remote-debugging-address=0.0.0.0
 ```
+
+`--window-size` matters here: an attached browser keeps its own viewport, and
+that is the size every surface frame is drawn and reported in. A browser the
+service launches is told the size instead (`--window-size` from `DS_WINDOW`'s
+geometry), so only an attached one needs it on its own command line.
 
 Reaching a browser across a bridge network needs a browser-facing host setting,
 which is not implemented yet: a browser there cannot load a `127.0.0.1` URL.
 
+### The live view in the rail panel
+
+The rail panel draws the window as a **shared surface**: the panel pulls the
+next frame from the service (`GET /surface/frame?after=<seq>&wait=<ms>`), which
+is a JPEG of the browser's own viewport, and posts the pointer, wheel, key and
+text events you make on it back (`POST /surface/input`) in that same coordinate
+space. Frames are pulled one at a time per
+viewer, so a slow link skips frames instead of queueing them.
+
+Because the host carries both directions over its own connection, the preview
+works wherever OpenChamber does — the desktop app, another machine, a tunnel —
+and the service is only ever called on its own loopback. Nothing needs to reach
+into the container.
+
+Who is driving is arbitrated by the host, which posts every change to
+`POST /surface/control`: `none`, `agent` while the agent's own browser actions
+hold it, or the viewer's id while a person does. Verification stands down while
+a person holds the surface, and the frames say when an agent is working
+(`x-surface-agent-active`).
+
+The pane can also send the size it would like (`POST /surface/resize`); this
+build keeps the design viewport it was given and scales the picture into the
+pane, so the width the gates judge and the width you see stay the same.
+
 ### Pick an element, get a chat reference
 
-Hold ⌘ (Ctrl on Windows/Linux) and click any element in the live window. The click
+Hold ⌘ (Ctrl on Windows/Linux) and click any element in the live view. The click
 is treated as a pick rather than a normal click, and the element becomes a
 reference chip on the chat composer via `host.attach` — carrying its CSS selector,
 outer markup, computed styles and the page URL. The chip's text reaches the model;
 its `data` payload is echoed back byte-for-byte to the extension. Hovering a
 reference row briefly re-flashes the matching element in the live window.
 
-Picks attach through the chat whose Work Status row is bound to the live
-window (the main window). Pick feedback composites above the page's own
-modals and dialogs, and elements inside shadow DOM resolve to the element you
-actually clicked.
+Picks attach through the chat whose Work Status row is bound to the live window
+(the main window). Pick feedback composites above the page's own modals and
+dialogs, and elements inside shadow DOM resolve to the element you actually
+clicked.
 
 ### The harness runs inside your project
 

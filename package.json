@@ -58,6 +58,7 @@
       "service": {
         "entry": "service/main.js",
         "runtime": "host",
+        "surface": true,
         "provides": [
           "browser"
         ]

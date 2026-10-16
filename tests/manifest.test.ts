@@ -17,7 +17,8 @@ test('package.json carries a valid OpenChamber manifest', async () => {
 // The surface stays thin, but `panel.entry` is required because the SDK only
 // accepts `page`, `commands` and `statusSection`'s frame beside it — they carry
 // the full-screen page and the `/design` slash command. `panel.dock`/`panel.size`
-// still require a shared `service.surface` we do not have, so they stay absent.
+// are legal now that the service declares a surface; they stay absent until we
+// have looked at the host's docked layout, so the host keeps its default.
 test('declared entries match the shipped files: panel row, page, command and status section', async () => {
   const json = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8')) as {
     openchamber: {
@@ -37,9 +38,10 @@ test('declared entries match the shipped files: panel row, page, command and sta
   // Panel identity plus the page the rail icon and the full-screen page paint.
   assert.equal(contributes.panel.id, 'design-studio');
   assert.equal(contributes.panel.entry, 'panel/index.html', 'panel.entry carries page + commands');
-  // dock/size only make sense beside a shared service surface, which we do not ship.
-  assert.equal(contributes.panel.dock, undefined, 'no dock without service.surface');
-  assert.equal(contributes.panel.size, undefined, 'no size without service.surface');
+  // dock/size are legal now that a surface ships, but the default is fine until
+  // the docked layout has been seen in the host.
+  assert.equal(contributes.panel.dock, undefined, 'dock stays at the host default');
+  assert.equal(contributes.panel.size, undefined, 'size stays at the host default');
 
   // The `/design` slash command stays; the "+"-menu attach dialog is gone —
   // Design Mode is started with `/design` inside the target chat, whose hidden
@@ -56,9 +58,10 @@ test('declared entries match the shipped files: panel row, page, command and sta
   assert.equal(contributes.statusSection?.defaultExpanded, true);
   assert.equal(typeof contributes.statusSection?.height, 'number', 'a compact height is declared');
 
-  // The service this host starts to own the real Chrome window.
+  // The service this host starts to own the real Chrome window, and the shared
+  // surface that draws it in the extension's rail panel.
   assert.equal(contributes.service?.runtime, 'host');
-  assert.equal(contributes.service?.surface, undefined);
+  assert.equal(contributes.service?.surface, true, 'the rail panel is a shared surface');
   assert.ok(contributes.service?.provides?.includes('browser'), 'service provides the browser role');
   // startSession and prompt are still needed by the row.
   assert.ok(contributes.capabilities?.includes('sessions'), 'declares the sessions capability');

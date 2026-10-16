@@ -22,6 +22,7 @@ import { PROBE_EXPR, PROBE_SCRIPT } from '../shared/probe-script.ts';
 import type { ProbeReport } from '../shared/verify-types.ts';
 import { cdpSocketUrl, cdpVersionUrl, readBrowserSettings, type BrowserSettings } from './browser-settings.ts';
 import { isExecutableFile, resolveChromeExecutable, type ChromeSource } from './chrome-path.ts';
+import { FrameStore, type SurfaceFrame } from './frame-store.ts';
 import { startViewerServer } from './viewer-server.ts';
 import { ArtifactContexts } from './artifact-context.ts';
 import type { ShellAuthority, DefaultContext } from './artifact-context.ts';
@@ -32,6 +33,10 @@ const VIEWPORT_HEIGHT = 800;
 const CDP_TIMEOUT_MS = 30_000;
 const NAVIGATE_TIMEOUT_MS = 30_000;
 const LAUNCH_TIMEOUT_MS = 20_000;
+/** JPEG quality for shared-surface frames: readable text at bounded bytes. */
+const SCREENCAST_QUALITY = 72;
+/** How long the screencast is left running after the last frame request. */
+const FRAME_IDLE_STOP_MS = 60_000;
 
 /** App-window geometry, `DS_WINDOW` = "x,y,w,h". */
 export type WindowSpec = { x: number; y: number; width: number; height: number };
@@ -120,12 +125,7 @@ export function buildLaunchArgs(spec: WindowSpec, profile: string, url: string):
   ];
 }
 
-export type BrowserFrame = {
-  jpeg: Buffer;
-  seq: number;
-  width: number;
-  height: number;
-};
+export type BrowserFrame = SurfaceFrame;
 
 export type PickedElement = {
   selector: string;
@@ -936,6 +936,22 @@ export class Browser {
   private launcher: BrowserLauncher | null = null;
   /** The endpoint of the browser we attached to, while we are attached to it. */
   private attachedEndpoint: string | null = null;
+  /** The newest surface frame, and the viewers waiting for the next one. */
+  private readonly frames = new FrameStore();
+  /** True while this browser is pushing frames for the shared surface. */
+  private framesRunning = false;
+  /** Stops the screencast when no viewer has asked for a frame for a while. */
+  private frameIdleTimer: NodeJS.Timeout | null = null;
+  /**
+   * The coordinate space the surface frames are in: the browser's REAL CSS
+   * viewport, which for an attached browser is not the one this service would
+   * have launched (`--window-size` is ours; a sidecar or a desktop window has its
+   * own). Read from the page's layout metrics, and re-read when a frame arrives
+   * in a different pixel size.
+   */
+  private frameViewport: { width: number; height: number } | null = null;
+  /** When the frame viewport was last re-read, to keep the check off the frame path. */
+  private frameViewportCheckedAt = 0;
   /** True while an observed/intentional close is tearing Chrome down. */
   private quitting = false;
   /** The in-flight teardown, so a second close (or stop) joins it instead of racing. */
@@ -1265,6 +1281,24 @@ export class Browser {
     cdp.on('Target.detachedFromTarget', (params) => {
       this.handleTargetGone(String(params.targetId ?? ''), typeof params.sessionId === 'string' ? params.sessionId : undefined);
     });
+    // Chrome pushes a frame whenever the surface picture changes. Only the newest
+    // is kept, and every frame is acknowledged at once so Chrome keeps sending:
+    // the backpressure the host wants is its own one-frame-in-flight rule, not a
+    // stalled screencast.
+    cdp.on('Page.screencastFrame', (params, session) => {
+      const data = typeof params.data === 'string' ? params.data : '';
+      const metadata = (params.metadata ?? {}) as { deviceWidth?: unknown };
+      const deviceWidth = Math.floor(Number(metadata.deviceWidth ?? 0));
+      if (session !== undefined && Number.isFinite(deviceWidth) && deviceWidth > 0) {
+        void this.refreshFrameViewportIfNeeded(cdp, session, deviceWidth);
+      }
+      const viewport = this.frameViewport ?? this.viewport();
+      if (data) this.frames.push(Buffer.from(data, 'base64'), viewport.width, viewport.height);
+      const frameId = params.sessionId;
+      if (typeof frameId === 'number') {
+        void cdp.send('Page.screencastFrameAck', { sessionId: frameId }, session).catch(() => undefined);
+      }
+    });
     // An attached browser can vanish without warning (a restarted sidecar, a
     // dropped socket): the transport closing is the same "the window is gone"
     // signal a destroyed target is. A deliberate close never reaches here.
@@ -1516,25 +1550,45 @@ export class Browser {
     });
   }
 
-  /** Apply a batch of input events (already in viewport CSS px). */
-  async input(events: SurfaceInputEvent[]): Promise<void> {
+  /**
+   * Apply a batch of input events. `space` names the coordinate space they are in,
+   * because two callers feed this:
+   *
+   *  · 'frame' — the agent's own browser actions (browser-control.ts): the
+   *    artifact frame's CSS pixels, mapped through the `#preview` element into
+   *    the shell's viewport, with the shell's own menu/pan conventions. That is
+   *    the input path they were built for.
+   *  · 'viewport' — the shared surface: the picture IS the viewport and the panel
+   *    maps its clicks into the size the frames reported, so these arrive as the
+   *    top-level viewport's CSS pixels already. They are dispatched as real input
+   *    with none of the shell conventions, because a person clicking the picture
+   *    must get exactly what a person clicking the window gets.
+   */
+  async input(events: SurfaceInputEvent[], space: 'frame' | 'viewport' = 'frame'): Promise<void> {
     return this.transaction(async()=>{
     const cdp = this.requireCdp();
     const session = this.requireSession();
+    const frameSpace = space === 'frame';
 
     for (const event of events) {
       await this.shellEval('new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))',true);
-      const rect=await this.shellEval("(()=>{const f=document.getElementById('preview'),r=f.getBoundingClientRect();return {x:r.x,y:r.y,width:r.width,height:r.height,cssWidth:f.clientWidth,cssHeight:f.clientHeight}})()") as {x:number;y:number;width:number;height:number;cssWidth:number;cssHeight:number};
-      if(event.type==='pointer'&&event.action==='down'&&this.canvasFlags.menu){await this.shellEval('__dsCanvas.dismissMenu()');continue;}
-      if(event.type==='pointer'&&(event.modifiers.ctrl||event.modifiers.meta)&&this.canvasFlags.pan){if(event.action==='up')await this.evalIn(`window.__dsPickAt(${event.x},${event.y})`,false);continue;}
+      const rect = frameSpace
+        ? await this.shellEval("(()=>{const f=document.getElementById('preview'),r=f.getBoundingClientRect();return {x:r.x,y:r.y,width:r.width,height:r.height,cssWidth:f.clientWidth,cssHeight:f.clientHeight}})()") as {x:number;y:number;width:number;height:number;cssWidth:number;cssHeight:number}
+        : null;
+      const at=(point:{x:number;y:number})=>rect
+        ? {x:rect.x+point.x*rect.width/rect.cssWidth,y:rect.y+point.y*rect.height/rect.cssHeight}
+        : {x:point.x,y:point.y};
+      if(frameSpace&&event.type==='pointer'&&event.action==='down'&&this.canvasFlags.menu){await this.shellEval('__dsCanvas.dismissMenu()');continue;}
+      if(frameSpace&&event.type==='pointer'&&(event.modifiers.ctrl||event.modifiers.meta)&&this.canvasFlags.pan){if(event.action==='up')await this.evalIn(`window.__dsPickAt(${event.x},${event.y})`,false);continue;}
       if (event.type === 'pointer') {
         const type = event.action === 'down' ? 'mousePressed' : event.action === 'up' ? 'mouseReleased' : 'mouseMoved';
+        const point=at(event);
         await cdp.send(
           'Input.dispatchMouseEvent',
           {
             type,
-            x: rect.x+event.x*rect.width/rect.cssWidth,
-            y: rect.y+event.y*rect.height/rect.cssHeight,
+            x: point.x,
+            y: point.y,
             button: buttonName(event.button),
             buttons: event.buttons,
             clickCount: event.action === 'move' ? 0 : 1,
@@ -1543,12 +1597,13 @@ export class Browser {
           session,
         );
       } else if (event.type === 'wheel') {
+        const point=at(event);
         await cdp.send(
           'Input.dispatchMouseEvent',
           {
             type: 'mouseWheel',
-            x: rect.x+event.x*rect.width/rect.cssWidth,
-            y: rect.y+event.y*rect.height/rect.cssHeight,
+            x: point.x,
+            y: point.y,
             deltaX: event.deltaX,
             deltaY: event.deltaY,
             modifiers: modifierBits(event.modifiers),
@@ -1556,7 +1611,7 @@ export class Browser {
           session,
         );
       } else if (event.type === 'key') {
-        await this.shellEval("document.getElementById('preview').focus()");
+        if(frameSpace)await this.shellEval("document.getElementById('preview').focus()");
         await cdp.send(
           'Input.dispatchKeyEvent',
           {
@@ -1568,7 +1623,7 @@ export class Browser {
           session,
         );
       } else {
-        await this.shellEval("document.getElementById('preview').focus()");
+        if(frameSpace)await this.shellEval("document.getElementById('preview').focus()");
         await cdp.send('Input.insertText', { text: event.text }, session);
       }
     }
@@ -1866,9 +1921,127 @@ export class Browser {
     return false;
   }
 
-  /** No live frames any more; kept for browser-control's scroll sizing helper. */
+  /**
+   * The newest surface frame, or null when there is nothing to show: the
+   * browser-control scroll helper sizes its steps from it.
+   */
   latestFrame(): BrowserFrame | null {
-    return null;
+    return this.frames.latest();
+  }
+
+  /**
+   * The next frame newer than `after`, held up to `waitMs` — the pull side of the
+   * shared surface. The screencast starts on first use: a service nobody is
+   * watching must not pay for frames, and the host stops asking when the last
+   * viewer leaves. Never throws: a browser that refuses the screencast leaves the
+   * pane blank (a caller answers 204), which is recoverable, where an error would
+   * end the host's session outright.
+   */
+  async surfaceFrame(after: number, waitMs: number): Promise<SurfaceFrame | null> {
+    if (!this.cdp || !this.sessionId) return null;
+    try {
+      await this.startFrames();
+    } catch {
+      return null;
+    }
+    this.scheduleFrameIdleStop();
+    return this.frames.next(after, waitMs);
+  }
+
+  /**
+   * Stop pushing frames once nobody has asked for a while. A pane that closes
+   * leaves the screencast running otherwise, and a page that animates would keep
+   * Chrome painting a picture no one is watching. The picture is dropped with it;
+   * the next request starts the screencast again and the sequence keeps counting.
+   */
+  private scheduleFrameIdleStop(): void {
+    if (this.frameIdleTimer) clearTimeout(this.frameIdleTimer);
+    this.frameIdleTimer = setTimeout(() => this.stopFrames(), FRAME_IDLE_STOP_MS);
+    this.frameIdleTimer.unref();
+  }
+
+  /** Start Chrome's screencast for the shared surface, once. */
+  private async startFrames(): Promise<void> {
+    if (this.framesRunning) return;
+    const cdp = this.requireCdp();
+    const session = this.requireSession();
+    this.framesRunning = true;
+    try {
+      // `Page.enable` is idempotent and the screencast needs it. `maxWidth`/
+      // `maxHeight` cap the picture at the viewport it stands for, so a device
+      // pixel ratio above 1 does not multiply the bytes the host has to carry.
+      await cdp.send('Page.enable', {}, session);
+      this.frameViewport = await this.readFrameViewport(cdp, session);
+      this.frameViewportCheckedAt = Date.now();
+      await cdp.send(
+        'Page.startScreencast',
+        {
+          format: 'jpeg',
+          quality: SCREENCAST_QUALITY,
+          maxWidth: this.viewportWidth,
+          maxHeight: this.viewportHeight,
+          everyNthFrame: 1,
+        },
+        session,
+      );
+    } catch (error) {
+      this.framesRunning = false;
+      throw error;
+    }
+  }
+
+  /**
+   * The browser's real CSS viewport: the space every surface frame is reported in
+   * and the space the panel maps its pointer into. A browser we launched answers
+   * with the size we asked for; an attached one answers with whatever it has.
+   */
+  private async readFrameViewport(
+    cdp: CdpClient,
+    session: string,
+  ): Promise<{ width: number; height: number }> {
+    try {
+      const metrics = await cdp.send('Page.getLayoutMetrics', {}, session);
+      const viewport = metrics.cssLayoutViewport as { clientWidth?: unknown; clientHeight?: unknown } | undefined;
+      const width = Math.floor(Number(viewport?.clientWidth ?? 0));
+      const height = Math.floor(Number(viewport?.clientHeight ?? 0));
+      if (Number.isFinite(width) && width > 0 && Number.isFinite(height) && height > 0) {
+        return { width, height };
+      }
+    } catch {
+      /* fall back to the size this service would have launched with */
+    }
+    return this.viewport();
+  }
+
+  /**
+   * Re-read the viewport when a frame arrives at a pixel size the reported space
+   * does not match — a window that was resized, or a device pixel ratio we
+   * guessed wrong. Bounded to one check a second so the frame path stays cheap.
+   */
+  private async refreshFrameViewportIfNeeded(cdp: CdpClient, session: string, deviceWidth: number): Promise<void> {
+    const current = this.frameViewport;
+    if (current && deviceWidth === current.width) return;
+    if (Date.now() - this.frameViewportCheckedAt < 1000) return;
+    this.frameViewportCheckedAt = Date.now();
+    const next = await this.readFrameViewport(cdp, session);
+    this.frameViewport = next;
+  }
+
+  /**
+   * Stop the screencast and release anyone waiting. Called from every teardown
+   * path: a frame request must never be left hanging on a browser that is gone.
+   */
+  private stopFrames(): void {
+    this.frames.close();
+    if (this.frameIdleTimer) {
+      clearTimeout(this.frameIdleTimer);
+      this.frameIdleTimer = null;
+    }
+    if (!this.framesRunning) return;
+    this.framesRunning = false;
+    const cdp = this.cdp;
+    if (!cdp) return;
+    void cdp.send('Page.stopScreencast', {}, this.sessionId ?? undefined).catch(() => undefined);
   }
 
   async state(): Promise<BrowserState> {
@@ -1930,6 +2103,7 @@ export class Browser {
    * the temp profile.
    */
   private async doQuit(): Promise<void> {
+    this.stopFrames();
     const cdp = this.cdp;
     if (cdp) {
       if (this.targetId) {
@@ -2022,6 +2196,7 @@ export class Browser {
   async stop(opts: { kill?: boolean } = {}): Promise<void> {
     const kill = opts.kill ?? true;
     if(kill&&!this.quitPromise&&(this.chrome||this.cdp)){await this.close();}
+    this.stopFrames();
     this.contexts?.close();this.contexts=null;
     await this.viewer?.close();this.viewer=null;
     // Join an in-flight window-close teardown so a relaunch never races it.

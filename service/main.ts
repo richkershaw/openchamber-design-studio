@@ -24,6 +24,7 @@ import { handleVerifyRequest } from './verify-routes.ts';
 import { writeHarnessPlugin } from './harness-plugin.ts';
 import { listProjectFiles, resolveReferencePath } from './project-files.ts';
 import { scaffoldProject } from './scaffold.ts';
+import { handleSurfaceRequest } from './surface-routes.ts';
 import { BROWSER_PROVIDER_PATH } from '@openchamber/sdk';
 
 const PORT = Number(process.env.OPENCHAMBER_SERVICE_PORT ?? 0);
@@ -103,6 +104,11 @@ const server = http.createServer(async (req, res) => {
   const params = url.searchParams;
 
   try {
+    // The shared surface (`contributes.service.surface`): the host pulls frames
+    // from here and pushes the viewer's input and control changes back, while the
+    // extension's rail panel shows the picture. See service/surface-routes.ts.
+    if (await handleSurfaceRequest(req, res, url)) return;
+
     // The agent-facing browser provider. The host posts every browser.* action
     // here with the same bearer token; we answer with the BrowserProviderResult
     // union. A failed action is a 200 with `ok:false` and an actionable message,

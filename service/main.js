@@ -434,6 +434,56 @@ function isExecutableFile(abs) {
   }
 }
 
+// service/frame-store.ts
+var FrameStore = class {
+  frame = null;
+  seq = 0;
+  waiters = /* @__PURE__ */ new Set();
+  /** The newest frame, or null before the first one arrived (or after `close`). */
+  latest() {
+    return this.frame;
+  }
+  /** Keep a frame from the browser and wake every waiter that wants it. */
+  push(jpeg, width, height) {
+    this.seq += 1;
+    const frame = { jpeg, seq: this.seq, width, height };
+    this.frame = frame;
+    for (const waiter of [...this.waiters]) {
+      if (frame.seq > waiter.after) this.settle(waiter, frame);
+    }
+    return frame;
+  }
+  /**
+   * The next frame newer than `after`, or null once `waitMs` has passed. A frame
+   * that is already newer resolves at once — the host's first request is
+   * `after=0`, which is "the picture, now" — and a non-positive wait never
+   * registers a waiter at all.
+   */
+  next(after, waitMs) {
+    const current = this.frame;
+    if (current && current.seq > after) return Promise.resolve(current);
+    if (waitMs <= 0) return Promise.resolve(null);
+    return new Promise((resolve) => {
+      const waiter = { after, resolve, timer: setTimeout(() => this.settle(waiter, null), waitMs) };
+      this.waiters.add(waiter);
+    });
+  }
+  /**
+   * Drop the picture and release every waiter with null. The sequence counter is
+   * deliberately kept: a viewer that has already drawn frame 57 must be able to
+   * ask for something newer after the browser comes back.
+   */
+  close() {
+    for (const waiter of [...this.waiters]) this.settle(waiter, null);
+    this.frame = null;
+  }
+  settle(waiter, frame) {
+    if (!this.waiters.delete(waiter)) return;
+    clearTimeout(waiter.timer);
+    waiter.resolve(frame);
+  }
+};
+
 // service/viewer-server.ts
 import { createServer } from "node:http";
 import { randomBytes, createHash } from "node:crypto";
@@ -1271,6 +1321,8 @@ var VIEWPORT_WIDTH = 1280;
 var VIEWPORT_HEIGHT = 800;
 var CDP_TIMEOUT_MS = 3e4;
 var LAUNCH_TIMEOUT_MS = 2e4;
+var SCREENCAST_QUALITY = 72;
+var FRAME_IDLE_STOP_MS = 6e4;
 var DEFAULT_WINDOW = { x: 80, y: 80, width: 1280, height: 800 };
 var MIN_WINDOW_EDGE = 200;
 var ANTI_THROTTLE_FLAGS = [
@@ -1974,6 +2026,22 @@ var Browser = class {
   launcher = null;
   /** The endpoint of the browser we attached to, while we are attached to it. */
   attachedEndpoint = null;
+  /** The newest surface frame, and the viewers waiting for the next one. */
+  frames = new FrameStore();
+  /** True while this browser is pushing frames for the shared surface. */
+  framesRunning = false;
+  /** Stops the screencast when no viewer has asked for a frame for a while. */
+  frameIdleTimer = null;
+  /**
+   * The coordinate space the surface frames are in: the browser's REAL CSS
+   * viewport, which for an attached browser is not the one this service would
+   * have launched (`--window-size` is ours; a sidecar or a desktop window has its
+   * own). Read from the page's layout metrics, and re-read when a frame arrives
+   * in a different pixel size.
+   */
+  frameViewport = null;
+  /** When the frame viewport was last re-read, to keep the check off the frame path. */
+  frameViewportCheckedAt = 0;
   /** True while an observed/intentional close is tearing Chrome down. */
   quitting = false;
   /** The in-flight teardown, so a second close (or stop) joins it instead of racing. */
@@ -2239,6 +2307,20 @@ var Browser = class {
     });
     cdp.on("Target.detachedFromTarget", (params) => {
       this.handleTargetGone(String(params.targetId ?? ""), typeof params.sessionId === "string" ? params.sessionId : void 0);
+    });
+    cdp.on("Page.screencastFrame", (params, session) => {
+      const data = typeof params.data === "string" ? params.data : "";
+      const metadata = params.metadata ?? {};
+      const deviceWidth = Math.floor(Number(metadata.deviceWidth ?? 0));
+      if (session !== void 0 && Number.isFinite(deviceWidth) && deviceWidth > 0) {
+        void this.refreshFrameViewportIfNeeded(cdp, session, deviceWidth);
+      }
+      const viewport = this.frameViewport ?? this.viewport();
+      if (data) this.frames.push(Buffer.from(data, "base64"), viewport.width, viewport.height);
+      const frameId = params.sessionId;
+      if (typeof frameId === "number") {
+        void cdp.send("Page.screencastFrameAck", { sessionId: frameId }, session).catch(() => void 0);
+      }
     });
     cdp.onTransportClose(() => {
       if (this.quitting) return;
@@ -2528,30 +2610,46 @@ var Browser = class {
       return { url: this.artifactUrl, title: this.artifactTitle, settled };
     });
   }
-  /** Apply a batch of input events (already in viewport CSS px). */
-  async input(events) {
+  /**
+   * Apply a batch of input events. `space` names the coordinate space they are in,
+   * because two callers feed this:
+   *
+   *  · 'frame' — the agent's own browser actions (browser-control.ts): the
+   *    artifact frame's CSS pixels, mapped through the `#preview` element into
+   *    the shell's viewport, with the shell's own menu/pan conventions. That is
+   *    the input path they were built for.
+   *  · 'viewport' — the shared surface: the picture IS the viewport and the panel
+   *    maps its clicks into the size the frames reported, so these arrive as the
+   *    top-level viewport's CSS pixels already. They are dispatched as real input
+   *    with none of the shell conventions, because a person clicking the picture
+   *    must get exactly what a person clicking the window gets.
+   */
+  async input(events, space = "frame") {
     return this.transaction(async () => {
       const cdp = this.requireCdp();
       const session = this.requireSession();
+      const frameSpace = space === "frame";
       for (const event of events) {
         await this.shellEval("new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))", true);
-        const rect = await this.shellEval("(()=>{const f=document.getElementById('preview'),r=f.getBoundingClientRect();return {x:r.x,y:r.y,width:r.width,height:r.height,cssWidth:f.clientWidth,cssHeight:f.clientHeight}})()");
-        if (event.type === "pointer" && event.action === "down" && this.canvasFlags.menu) {
+        const rect = frameSpace ? await this.shellEval("(()=>{const f=document.getElementById('preview'),r=f.getBoundingClientRect();return {x:r.x,y:r.y,width:r.width,height:r.height,cssWidth:f.clientWidth,cssHeight:f.clientHeight}})()") : null;
+        const at = (point) => rect ? { x: rect.x + point.x * rect.width / rect.cssWidth, y: rect.y + point.y * rect.height / rect.cssHeight } : { x: point.x, y: point.y };
+        if (frameSpace && event.type === "pointer" && event.action === "down" && this.canvasFlags.menu) {
           await this.shellEval("__dsCanvas.dismissMenu()");
           continue;
         }
-        if (event.type === "pointer" && (event.modifiers.ctrl || event.modifiers.meta) && this.canvasFlags.pan) {
+        if (frameSpace && event.type === "pointer" && (event.modifiers.ctrl || event.modifiers.meta) && this.canvasFlags.pan) {
           if (event.action === "up") await this.evalIn(`window.__dsPickAt(${event.x},${event.y})`, false);
           continue;
         }
         if (event.type === "pointer") {
           const type = event.action === "down" ? "mousePressed" : event.action === "up" ? "mouseReleased" : "mouseMoved";
+          const point = at(event);
           await cdp.send(
             "Input.dispatchMouseEvent",
             {
               type,
-              x: rect.x + event.x * rect.width / rect.cssWidth,
-              y: rect.y + event.y * rect.height / rect.cssHeight,
+              x: point.x,
+              y: point.y,
               button: buttonName(event.button),
               buttons: event.buttons,
               clickCount: event.action === "move" ? 0 : 1,
@@ -2560,12 +2658,13 @@ var Browser = class {
             session
           );
         } else if (event.type === "wheel") {
+          const point = at(event);
           await cdp.send(
             "Input.dispatchMouseEvent",
             {
               type: "mouseWheel",
-              x: rect.x + event.x * rect.width / rect.cssWidth,
-              y: rect.y + event.y * rect.height / rect.cssHeight,
+              x: point.x,
+              y: point.y,
               deltaX: event.deltaX,
               deltaY: event.deltaY,
               modifiers: modifierBits(event.modifiers)
@@ -2573,7 +2672,7 @@ var Browser = class {
             session
           );
         } else if (event.type === "key") {
-          await this.shellEval("document.getElementById('preview').focus()");
+          if (frameSpace) await this.shellEval("document.getElementById('preview').focus()");
           await cdp.send(
             "Input.dispatchKeyEvent",
             {
@@ -2585,7 +2684,7 @@ var Browser = class {
             session
           );
         } else {
-          await this.shellEval("document.getElementById('preview').focus()");
+          if (frameSpace) await this.shellEval("document.getElementById('preview').focus()");
           await cdp.send("Input.insertText", { text: event.text }, session);
         }
       }
@@ -2871,9 +2970,114 @@ var Browser = class {
     }
     return false;
   }
-  /** No live frames any more; kept for browser-control's scroll sizing helper. */
+  /**
+   * The newest surface frame, or null when there is nothing to show: the
+   * browser-control scroll helper sizes its steps from it.
+   */
   latestFrame() {
-    return null;
+    return this.frames.latest();
+  }
+  /**
+   * The next frame newer than `after`, held up to `waitMs` — the pull side of the
+   * shared surface. The screencast starts on first use: a service nobody is
+   * watching must not pay for frames, and the host stops asking when the last
+   * viewer leaves. Never throws: a browser that refuses the screencast leaves the
+   * pane blank (a caller answers 204), which is recoverable, where an error would
+   * end the host's session outright.
+   */
+  async surfaceFrame(after, waitMs) {
+    if (!this.cdp || !this.sessionId) return null;
+    try {
+      await this.startFrames();
+    } catch {
+      return null;
+    }
+    this.scheduleFrameIdleStop();
+    return this.frames.next(after, waitMs);
+  }
+  /**
+   * Stop pushing frames once nobody has asked for a while. A pane that closes
+   * leaves the screencast running otherwise, and a page that animates would keep
+   * Chrome painting a picture no one is watching. The picture is dropped with it;
+   * the next request starts the screencast again and the sequence keeps counting.
+   */
+  scheduleFrameIdleStop() {
+    if (this.frameIdleTimer) clearTimeout(this.frameIdleTimer);
+    this.frameIdleTimer = setTimeout(() => this.stopFrames(), FRAME_IDLE_STOP_MS);
+    this.frameIdleTimer.unref();
+  }
+  /** Start Chrome's screencast for the shared surface, once. */
+  async startFrames() {
+    if (this.framesRunning) return;
+    const cdp = this.requireCdp();
+    const session = this.requireSession();
+    this.framesRunning = true;
+    try {
+      await cdp.send("Page.enable", {}, session);
+      this.frameViewport = await this.readFrameViewport(cdp, session);
+      this.frameViewportCheckedAt = Date.now();
+      await cdp.send(
+        "Page.startScreencast",
+        {
+          format: "jpeg",
+          quality: SCREENCAST_QUALITY,
+          maxWidth: this.viewportWidth,
+          maxHeight: this.viewportHeight,
+          everyNthFrame: 1
+        },
+        session
+      );
+    } catch (error) {
+      this.framesRunning = false;
+      throw error;
+    }
+  }
+  /**
+   * The browser's real CSS viewport: the space every surface frame is reported in
+   * and the space the panel maps its pointer into. A browser we launched answers
+   * with the size we asked for; an attached one answers with whatever it has.
+   */
+  async readFrameViewport(cdp, session) {
+    try {
+      const metrics = await cdp.send("Page.getLayoutMetrics", {}, session);
+      const viewport = metrics.cssLayoutViewport;
+      const width = Math.floor(Number(viewport?.clientWidth ?? 0));
+      const height = Math.floor(Number(viewport?.clientHeight ?? 0));
+      if (Number.isFinite(width) && width > 0 && Number.isFinite(height) && height > 0) {
+        return { width, height };
+      }
+    } catch {
+    }
+    return this.viewport();
+  }
+  /**
+   * Re-read the viewport when a frame arrives at a pixel size the reported space
+   * does not match — a window that was resized, or a device pixel ratio we
+   * guessed wrong. Bounded to one check a second so the frame path stays cheap.
+   */
+  async refreshFrameViewportIfNeeded(cdp, session, deviceWidth) {
+    const current = this.frameViewport;
+    if (current && deviceWidth === current.width) return;
+    if (Date.now() - this.frameViewportCheckedAt < 1e3) return;
+    this.frameViewportCheckedAt = Date.now();
+    const next = await this.readFrameViewport(cdp, session);
+    this.frameViewport = next;
+  }
+  /**
+   * Stop the screencast and release anyone waiting. Called from every teardown
+   * path: a frame request must never be left hanging on a browser that is gone.
+   */
+  stopFrames() {
+    this.frames.close();
+    if (this.frameIdleTimer) {
+      clearTimeout(this.frameIdleTimer);
+      this.frameIdleTimer = null;
+    }
+    if (!this.framesRunning) return;
+    this.framesRunning = false;
+    const cdp = this.cdp;
+    if (!cdp) return;
+    void cdp.send("Page.stopScreencast", {}, this.sessionId ?? void 0).catch(() => void 0);
   }
   async state() {
     let url = "";
@@ -2928,6 +3132,7 @@ var Browser = class {
    * the temp profile.
    */
   async doQuit() {
+    this.stopFrames();
     const cdp = this.cdp;
     if (cdp) {
       if (this.targetId) {
@@ -3011,6 +3216,7 @@ var Browser = class {
     if (kill && !this.quitPromise && (this.chrome || this.cdp)) {
       await this.close();
     }
+    this.stopFrames();
     this.contexts?.close();
     this.contexts = null;
     await this.viewer?.close();
@@ -3430,72 +3636,6 @@ async function startAndWait(command, dir, url, timeoutMs) {
   };
 }
 
-// service/surface.ts
-var browser = null;
-async function ensureBrowser(url) {
-  if (!browser) browser = new Browser();
-  if (url !== void 0) await browser.start(url);
-  return browser;
-}
-function getBrowser() {
-  return browser;
-}
-async function stopBrowser() {
-  if (!browser) return;
-  const current = browser;
-  browser = null;
-  await current.stop({ kill: process.env.DS_KILL_WINDOW_ON_STOP === "1" });
-}
-function getController() {
-  return "none";
-}
-
-// service/bridge-claim.ts
-import { randomBytes as randomBytes2 } from "node:crypto";
-var BridgeClaims = class {
-  token = "";
-  until = 0;
-  ttlMs;
-  now;
-  constructor(ttlMs = 4e3, now = Date.now) {
-    this.ttlMs = ttlMs;
-    this.now = now;
-  }
-  /** Claim or heartbeat. An existing holder renews with its token; anyone else is refused while the claim is warm. */
-  claim(requestedToken) {
-    const at = this.now();
-    if (this.until > at) {
-      if (requestedToken !== void 0 && requestedToken === this.token) {
-        this.until = at + this.ttlMs;
-        return { ok: true, token: this.token, ttlMs: this.ttlMs };
-      }
-      return { ok: false, bridgeActive: true };
-    }
-    if (requestedToken === void 0 || requestedToken !== this.token) this.token = newBridgeToken();
-    this.until = at + this.ttlMs;
-    return { ok: true, token: this.token, ttlMs: this.ttlMs };
-  }
-  /** Give the bridge up early (the holding pane is shutting down cleanly). */
-  release(token) {
-    if (this.until > this.now() && this.token === token) {
-      this.token = "";
-      this.until = 0;
-      return true;
-    }
-    return false;
-  }
-  /** Whether a warm claim exists right now — what /state reports to every panel. */
-  active() {
-    return this.until > this.now();
-  }
-};
-function newBridgeToken() {
-  return `ds-bridge-${randomBytes2(12).toString("hex")}`;
-}
-
-// service/browser-control.ts
-import path6 from "node:path";
-
 // node_modules/@openchamber/sdk/dist/scrollbar-style.js
 var GUEST_SCROLLING_ATTRIBUTE = "data-oc-scrolling";
 var GUEST_SCROLLBAR_CSS = `
@@ -3630,8 +3770,199 @@ var readBrowserProviderRequest = (body) => {
 };
 
 // node_modules/@openchamber/sdk/dist/service-surface.js
+var SURFACE_FRAME_PATH = "/surface/frame";
+var SURFACE_INPUT_PATH = "/surface/input";
+var SURFACE_CONTROL_PATH = "/surface/control";
+var SURFACE_RESIZE_PATH = "/surface/resize";
+var SURFACE_CLIPBOARD_PATH = "/surface/clipboard";
+var SURFACE_SEQ_HEADER = "x-surface-seq";
+var SURFACE_WIDTH_HEADER = "x-surface-width";
+var SURFACE_HEIGHT_HEADER = "x-surface-height";
+var SURFACE_AGENT_ACTIVE_HEADER = "x-surface-agent-active";
+var SURFACE_FRAME_SEQ_HEADER = "x-surface-frame-seq";
+var SURFACE_FRAME_WAIT_MS = 25e3;
+var SURFACE_FRAME_MAX_BYTES = 8e6;
+var SURFACE_INPUT_BATCH_MAX = 256;
+var SURFACE_TEXT_MAX = 64e3;
+var SURFACE_DIMENSION_MAX = 16384;
+var SURFACE_AGENT_HOLD_MS = 3e4;
 var SURFACE_CONTROLLERS = ["none", "agent", "user"];
+var isFiniteNumber = (value) => Number(value) === value && Number.isFinite(value);
+var isBool = (value) => value === true || value === false;
+var isText = (value) => String(value) === value;
+var readModifiers = (value) => {
+  if (Object(value) !== value || value === null)
+    return null;
+  const wire = value;
+  if (!isBool(wire.alt) || !isBool(wire.ctrl) || !isBool(wire.meta) || !isBool(wire.shift))
+    return null;
+  return { alt: wire.alt, ctrl: wire.ctrl, meta: wire.meta, shift: wire.shift };
+};
+var readEvent = (value) => {
+  if (value.type === "text") {
+    if (!isText(value.text) || value.text.length > SURFACE_TEXT_MAX)
+      return null;
+    return { type: "text", text: value.text };
+  }
+  const modifiers = readModifiers(value.modifiers);
+  if (!modifiers)
+    return null;
+  if (value.type === "pointer") {
+    if (value.action !== "down" && value.action !== "up" && value.action !== "move")
+      return null;
+    if (!isFiniteNumber(value.x) || !isFiniteNumber(value.y) || !isFiniteNumber(value.button) || !isFiniteNumber(value.buttons))
+      return null;
+    return { type: "pointer", action: value.action, x: value.x, y: value.y, button: value.button, buttons: value.buttons, modifiers };
+  }
+  if (value.type === "wheel") {
+    if (!isFiniteNumber(value.x) || !isFiniteNumber(value.y) || !isFiniteNumber(value.deltaX) || !isFiniteNumber(value.deltaY))
+      return null;
+    return { type: "wheel", x: value.x, y: value.y, deltaX: value.deltaX, deltaY: value.deltaY, modifiers };
+  }
+  if (value.type === "key") {
+    if (value.action !== "down" && value.action !== "up")
+      return null;
+    if (!isText(value.key) || !isText(value.code) || value.key.length > 64 || value.code.length > 64)
+      return null;
+    return { type: "key", action: value.action, key: value.key, code: value.code, modifiers };
+  }
+  return null;
+};
+var readSurfaceInputBatch = (body) => {
+  let parsed;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return null;
+  }
+  if (Object(parsed) !== parsed || parsed === null || !Array.isArray(parsed.events))
+    return null;
+  if (parsed.events.length > SURFACE_INPUT_BATCH_MAX)
+    return null;
+  const events = [];
+  for (const item of parsed.events) {
+    if (Object(item) !== item || item === null)
+      return null;
+    const event = readEvent(item);
+    if (!event)
+      return null;
+    events.push(event);
+  }
+  return { events };
+};
 var CONTROLLERS = new Set(SURFACE_CONTROLLERS);
+var readSurfaceControlNotice = (body) => {
+  let parsed;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return null;
+  }
+  if (Object(parsed) !== parsed || parsed === null)
+    return null;
+  const { controller, viewer } = parsed;
+  if (!isText(controller) || !CONTROLLERS.has(controller))
+    return null;
+  const notice = { controller };
+  if (controller === "user" && isText(viewer) && viewer.length > 0)
+    notice.viewer = viewer;
+  return notice;
+};
+var readSurfaceResizeRequest = (body) => {
+  let parsed;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return null;
+  }
+  if (Object(parsed) !== parsed || parsed === null)
+    return null;
+  const { width, height } = parsed;
+  if (!isFiniteNumber(width) || !isFiniteNumber(height))
+    return null;
+  if (width < 1 || height < 1 || width > SURFACE_DIMENSION_MAX || height > SURFACE_DIMENSION_MAX)
+    return null;
+  return { width: Math.round(width), height: Math.round(height) };
+};
+
+// service/surface.ts
+var browser = null;
+async function ensureBrowser(url) {
+  if (!browser) browser = new Browser();
+  if (url !== void 0) await browser.start(url);
+  return browser;
+}
+function getBrowser() {
+  return browser;
+}
+async function stopBrowser() {
+  if (!browser) return;
+  const current = browser;
+  browser = null;
+  controlNotice = null;
+  agentActiveAt = 0;
+  await current.stop({ kill: process.env.DS_KILL_WINDOW_ON_STOP === "1" });
+}
+var controlNotice = null;
+var agentActiveAt = 0;
+function setController(notice) {
+  controlNotice = notice;
+}
+function getController() {
+  return controlNotice?.controller ?? "none";
+}
+function noteAgentActivity() {
+  agentActiveAt = Date.now();
+}
+function agentActive() {
+  return agentActiveAt !== 0 && Date.now() - agentActiveAt < SURFACE_AGENT_HOLD_MS;
+}
+
+// service/bridge-claim.ts
+import { randomBytes as randomBytes2 } from "node:crypto";
+var BridgeClaims = class {
+  token = "";
+  until = 0;
+  ttlMs;
+  now;
+  constructor(ttlMs = 4e3, now = Date.now) {
+    this.ttlMs = ttlMs;
+    this.now = now;
+  }
+  /** Claim or heartbeat. An existing holder renews with its token; anyone else is refused while the claim is warm. */
+  claim(requestedToken) {
+    const at = this.now();
+    if (this.until > at) {
+      if (requestedToken !== void 0 && requestedToken === this.token) {
+        this.until = at + this.ttlMs;
+        return { ok: true, token: this.token, ttlMs: this.ttlMs };
+      }
+      return { ok: false, bridgeActive: true };
+    }
+    if (requestedToken === void 0 || requestedToken !== this.token) this.token = newBridgeToken();
+    this.until = at + this.ttlMs;
+    return { ok: true, token: this.token, ttlMs: this.ttlMs };
+  }
+  /** Give the bridge up early (the holding pane is shutting down cleanly). */
+  release(token) {
+    if (this.until > this.now() && this.token === token) {
+      this.token = "";
+      this.until = 0;
+      return true;
+    }
+    return false;
+  }
+  /** Whether a warm claim exists right now — what /state reports to every panel. */
+  active() {
+    return this.until > this.now();
+  }
+};
+function newBridgeToken() {
+  return `ds-bridge-${randomBytes2(12).toString("hex")}`;
+}
+
+// service/browser-control.ts
+import path6 from "node:path";
 
 // service/gates/probe.ts
 var INTERACTIVE_TAGS = /* @__PURE__ */ new Set(["a", "button", "input", "select", "textarea", "summary", "option"]);
@@ -4781,6 +5112,7 @@ async function handleBrowserControl(_req, body) {
     );
   }
   try {
+    noteAgentActivity();
     const browser2 = await ensureBrowser();
     const dir = projectDir(request.context);
     switch (request.action) {
@@ -7147,12 +7479,114 @@ ${tail(output)}` });
   });
 }
 
-// service/main.ts
-var PORT = Number(process.env.OPENCHAMBER_SERVICE_PORT ?? 0);
-var TOKEN = process.env.OPENCHAMBER_SERVICE_TOKEN ?? "";
-if (!PORT || !TOKEN) {
-  console.error("[design-studio] missing OPENCHAMBER_SERVICE_PORT or OPENCHAMBER_SERVICE_TOKEN");
-  process.exit(1);
+// service/surface-routes.ts
+var STALE_FRAME_TOLERANCE = 2;
+var BODY_MAX_BYTES = 1e6;
+var SURFACE_PATHS = /* @__PURE__ */ new Set([
+  SURFACE_FRAME_PATH,
+  SURFACE_INPUT_PATH,
+  SURFACE_CONTROL_PATH,
+  SURFACE_RESIZE_PATH,
+  SURFACE_CLIPBOARD_PATH
+]);
+async function handleSurfaceRequest(req, res, url) {
+  const pathname = url.pathname;
+  if (!SURFACE_PATHS.has(pathname)) return false;
+  if (pathname === SURFACE_FRAME_PATH) {
+    if (req.method !== "GET") return methodNotAllowed(res, "GET");
+    await handleFrame(res, url.searchParams);
+    return true;
+  }
+  if (pathname === SURFACE_CLIPBOARD_PATH) {
+    if (req.method !== "GET") return methodNotAllowed(res, "GET");
+    handleClipboard(res);
+    return true;
+  }
+  if (req.method !== "POST") return methodNotAllowed(res, "POST");
+  if (pathname === SURFACE_INPUT_PATH) {
+    await handleInput(req, res);
+    return true;
+  }
+  if (pathname === SURFACE_CONTROL_PATH) {
+    await handleControl(req, res);
+    return true;
+  }
+  await handleResize2(req, res);
+  return true;
+}
+async function handleFrame(res, params) {
+  const after = clampInt(params.get("after"), 0, Number.MAX_SAFE_INTEGER, 0);
+  const wait = clampInt(params.get("wait"), 0, SURFACE_FRAME_WAIT_MS, 0);
+  const browser2 = getBrowser();
+  const frame = browser2 ? await browser2.surfaceFrame(after, wait) : null;
+  if (!frame || frame.jpeg.length === 0 || frame.jpeg.length > SURFACE_FRAME_MAX_BYTES || frame.width > SURFACE_DIMENSION_MAX || frame.height > SURFACE_DIMENSION_MAX) {
+    res.writeHead(204, { "cache-control": "no-store" });
+    res.end();
+    return;
+  }
+  const headers = {
+    "content-type": "image/jpeg",
+    "content-length": frame.jpeg.length,
+    "cache-control": "no-store",
+    [SURFACE_SEQ_HEADER]: frame.seq,
+    [SURFACE_WIDTH_HEADER]: frame.width,
+    [SURFACE_HEIGHT_HEADER]: frame.height
+  };
+  if (agentActive()) headers[SURFACE_AGENT_ACTIVE_HEADER] = "1";
+  res.writeHead(200, headers);
+  res.end(frame.jpeg);
+}
+async function handleInput(req, res) {
+  const body = await readBody2(req, BODY_MAX_BYTES);
+  if (body === null) {
+    sendJson2(res, 413, { error: "input body is too large" });
+    return;
+  }
+  const batch = readSurfaceInputBatch(body);
+  if (batch === null) {
+    sendJson2(res, 400, { error: "input batch is not valid" });
+    return;
+  }
+  const browser2 = getBrowser();
+  const latest = browser2?.latestFrame() ?? null;
+  if (!browser2 || !latest) {
+    sendJson2(res, 409, { error: "there is no live picture to apply input to" });
+    return;
+  }
+  const drawn = intHeader(req, SURFACE_FRAME_SEQ_HEADER);
+  if (drawn > 0 && latest.seq - drawn > STALE_FRAME_TOLERANCE) {
+    sendJson2(res, 409, { error: "the picture has moved on" });
+    return;
+  }
+  await browser2.input(batch.events, "viewport");
+  sendJson2(res, 200, { ok: true });
+}
+async function handleControl(req, res) {
+  const body = await readBody2(req, BODY_MAX_BYTES);
+  const notice = body === null ? null : readSurfaceControlNotice(body);
+  if (notice === null) {
+    sendJson2(res, 400, { error: "control notice is not valid" });
+    return;
+  }
+  setController(notice);
+  sendJson2(res, 200, { ok: true });
+}
+async function handleResize2(req, res) {
+  const body = await readBody2(req, BODY_MAX_BYTES);
+  const request = body === null ? null : readSurfaceResizeRequest(body);
+  if (request === null) {
+    sendJson2(res, 400, { error: "resize request is not valid" });
+    return;
+  }
+  sendJson2(res, 400, { error: "the design viewport is fixed; the picture is scaled to the pane" });
+}
+function handleClipboard(res) {
+  sendJson2(res, 501, { error: "clipboard reads are not implemented yet" });
+}
+function methodNotAllowed(res, allow) {
+  res.writeHead(405, { allow, "cache-control": "no-store" });
+  res.end();
+  return true;
 }
 function sendJson2(res, status, body) {
   const text = JSON.stringify(body);
@@ -7163,7 +7597,47 @@ function sendJson2(res, status, body) {
   });
   res.end(text);
 }
-async function readBody2(req) {
+function clampInt(raw, min, max, fallback) {
+  const value = Number(raw ?? "");
+  if (!Number.isFinite(value)) return fallback;
+  return Math.min(max, Math.max(min, Math.trunc(value)));
+}
+function intHeader(req, name) {
+  const value = Number(req.headers[name]);
+  return Number.isFinite(value) && value > 0 ? Math.trunc(value) : 0;
+}
+async function readBody2(req, limit) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    const buffer = chunk;
+    size += buffer.length;
+    if (size > limit) {
+      req.destroy();
+      return null;
+    }
+    chunks.push(buffer);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+// service/main.ts
+var PORT = Number(process.env.OPENCHAMBER_SERVICE_PORT ?? 0);
+var TOKEN = process.env.OPENCHAMBER_SERVICE_TOKEN ?? "";
+if (!PORT || !TOKEN) {
+  console.error("[design-studio] missing OPENCHAMBER_SERVICE_PORT or OPENCHAMBER_SERVICE_TOKEN");
+  process.exit(1);
+}
+function sendJson3(res, status, body) {
+  const text = JSON.stringify(body);
+  res.writeHead(status, {
+    "content-type": "application/json; charset=utf-8",
+    "content-length": Buffer.byteLength(text),
+    "cache-control": "no-store"
+  });
+  res.end(text);
+}
+async function readBody3(req) {
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
   return Buffer.concat(chunks).toString("utf8");
@@ -7203,16 +7677,17 @@ var bridge = new BridgeClaims();
 var server = http.createServer(async (req, res) => {
   const auth = req.headers["authorization"];
   if (auth !== `Bearer ${TOKEN}`) {
-    sendJson2(res, 401, { error: "unauthorized" });
+    sendJson3(res, 401, { error: "unauthorized" });
     return;
   }
   const url = new URL(req.url ?? "/", `http://127.0.0.1:${PORT}`);
   const params = url.searchParams;
   try {
+    if (await handleSurfaceRequest(req, res, url)) return;
     if (req.method === "POST" && url.pathname === BROWSER_PROVIDER_PATH) {
-      const body = await readBody2(req);
+      const body = await readBody3(req);
       const result = await handleBrowserControl(req, body);
-      sendJson2(res, 200, result);
+      sendJson3(res, 200, result);
       return;
     }
     if (url.pathname === "/verify" || url.pathname.startsWith("/verify/")) {
@@ -7220,111 +7695,111 @@ var server = http.createServer(async (req, res) => {
     }
     if (url.pathname === "/harness") {
       if (req.method !== "POST") {
-        sendJson2(res, 405, { error: "POST required" });
+        sendJson3(res, 405, { error: "POST required" });
         return;
       }
       let parsed;
       try {
-        parsed = JSON.parse(await readBody2(req));
+        parsed = JSON.parse(await readBody3(req));
       } catch {
-        sendJson2(res, 400, { error: "body must be JSON" });
+        sendJson3(res, 400, { error: "body must be JSON" });
         return;
       }
       const dir = parsed?.dir;
       if (typeof dir !== "string" || !path11.isAbsolute(dir)) {
-        sendJson2(res, 400, { error: "dir must be an absolute project path" });
+        sendJson3(res, 400, { error: "dir must be an absolute project path" });
         return;
       }
       try {
-        sendJson2(res, 200, await writeHarnessPlugin(dir));
+        sendJson3(res, 200, await writeHarnessPlugin(dir));
       } catch (error) {
-        sendJson2(res, 400, { error: error instanceof Error ? error.message : "could not write harness plugin" });
+        sendJson3(res, 400, { error: error instanceof Error ? error.message : "could not write harness plugin" });
       }
       return;
     }
     if (url.pathname === "/reference") {
       if (req.method !== "POST") {
-        sendJson2(res, 405, { error: "POST required" });
+        sendJson3(res, 405, { error: "POST required" });
         return;
       }
       let parsed;
       try {
-        parsed = JSON.parse(await readBody2(req));
+        parsed = JSON.parse(await readBody3(req));
       } catch {
-        sendJson2(res, 400, { error: "body must be JSON" });
+        sendJson3(res, 400, { error: "body must be JSON" });
         return;
       }
       const body = parsed;
       if (typeof body?.dir !== "string" || typeof body.path !== "string") {
-        sendJson2(res, 400, { error: "dir and path must be strings. Paste an accessible file path." });
+        sendJson3(res, 400, { error: "dir and path must be strings. Paste an accessible file path." });
         return;
       }
       try {
-        sendJson2(res, 200, { ...await resolveReferencePath(body.dir, body.path) });
+        sendJson3(res, 200, { ...await resolveReferencePath(body.dir, body.path) });
       } catch (error) {
-        sendJson2(res, 400, { error: error instanceof Error ? error.message : "could not validate file path" });
+        sendJson3(res, 400, { error: error instanceof Error ? error.message : "could not validate file path" });
       }
       return;
     }
     if (url.pathname === "/files") {
       if (req.method !== "POST") {
-        sendJson2(res, 405, { error: "POST required" });
+        sendJson3(res, 405, { error: "POST required" });
         return;
       }
       let parsed;
       try {
-        parsed = JSON.parse(await readBody2(req));
+        parsed = JSON.parse(await readBody3(req));
       } catch {
-        sendJson2(res, 400, { error: "body must be JSON" });
+        sendJson3(res, 400, { error: "body must be JSON" });
         return;
       }
       const body = parsed;
       const dir = body?.dir;
       if (typeof dir !== "string" || !path11.isAbsolute(dir)) {
-        sendJson2(res, 400, { error: "dir must be an absolute project path" });
+        sendJson3(res, 400, { error: "dir must be an absolute project path" });
         return;
       }
       const limit = body?.limit;
       if (limit !== void 0 && (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1)) {
-        sendJson2(res, 400, { error: "limit must be a positive integer" });
+        sendJson3(res, 400, { error: "limit must be a positive integer" });
         return;
       }
       try {
-        sendJson2(res, 200, { ok: true, files: await listProjectFiles(dir, limit) });
+        sendJson3(res, 200, { ok: true, files: await listProjectFiles(dir, limit) });
       } catch (error) {
-        sendJson2(res, 200, { ok: false, error: error instanceof Error ? error.message : "could not list files" });
+        sendJson3(res, 200, { ok: false, error: error instanceof Error ? error.message : "could not list files" });
       }
       return;
     }
     if (url.pathname === "/scaffold") {
       if (req.method !== "POST") {
-        sendJson2(res, 405, { error: "POST required" });
+        sendJson3(res, 405, { error: "POST required" });
         return;
       }
       let parsed;
       try {
-        parsed = JSON.parse(await readBody2(req));
+        parsed = JSON.parse(await readBody3(req));
       } catch {
-        sendJson2(res, 400, { error: "body must be JSON" });
+        sendJson3(res, 400, { error: "body must be JSON" });
         return;
       }
       const body = parsed;
       const dir = body?.dir;
       const type = body?.type;
       if (typeof dir !== "string" || !path11.isAbsolute(dir)) {
-        sendJson2(res, 400, { error: "dir must be an absolute project path" });
+        sendJson3(res, 400, { error: "dir must be an absolute project path" });
         return;
       }
       if (typeof type !== "string" || type.trim() === "") {
-        sendJson2(res, 400, { error: "type must be a non-empty string" });
+        sendJson3(res, 400, { error: "type must be a non-empty string" });
         return;
       }
       if (body?.designSystemId !== void 0 && typeof body.designSystemId !== "string") {
-        sendJson2(res, 400, { error: "designSystemId must be a string" });
+        sendJson3(res, 400, { error: "designSystemId must be a string" });
         return;
       }
       const str = (value) => typeof value === "string" ? value : void 0;
-      sendJson2(
+      sendJson3(
         res,
         200,
         await scaffoldProject({
@@ -7340,87 +7815,87 @@ var server = http.createServer(async (req, res) => {
     }
     if (url.pathname === "/server/start") {
       if (req.method !== "POST") {
-        sendJson2(res, 405, { error: "POST required" });
+        sendJson3(res, 405, { error: "POST required" });
         return;
       }
       let parsed;
       try {
-        parsed = JSON.parse(await readBody2(req));
+        parsed = JSON.parse(await readBody3(req));
       } catch {
-        sendJson2(res, 400, { error: "body must be JSON" });
+        sendJson3(res, 400, { error: "body must be JSON" });
         return;
       }
       const dir = parsed?.dir;
       if (typeof dir !== "string" || !path11.isAbsolute(dir)) {
-        sendJson2(res, 400, { error: "dir must be an absolute project path" });
+        sendJson3(res, 400, { error: "dir must be an absolute project path" });
         return;
       }
       const targetUrl = parsed?.url;
       if (typeof targetUrl !== "string" || targetUrl === "") {
-        sendJson2(res, 400, { error: "url is required" });
+        sendJson3(res, 400, { error: "url is required" });
         return;
       }
       if (!isLoopbackUrl(targetUrl)) {
-        sendJson2(res, 400, { error: "url must be a loopback address" });
+        sendJson3(res, 400, { error: "url must be a loopback address" });
         return;
       }
       try {
         const { config } = await readStudioConfig(dir);
         if (!config?.url?.trim()) {
-          sendJson2(res, 200, { ok: false, started: false, up: false, error: "no .design-studio.json url found" });
+          sendJson3(res, 200, { ok: false, started: false, up: false, error: "no .design-studio.json url found" });
           return;
         }
         const configuredUrl = config.url.trim();
         if (!isLoopbackUrl(configuredUrl)) {
-          sendJson2(res, 200, { ok: false, started: false, up: false, error: "configured url is not loopback" });
+          sendJson3(res, 200, { ok: false, started: false, up: false, error: "configured url is not loopback" });
           return;
         }
         const result = await ensureDevServer(configuredUrl, { dir, ownedOnly: true });
-        sendJson2(res, 200, { ok: result.up, started: result.started, up: result.up, error: result.error });
+        sendJson3(res, 200, { ok: result.up, started: result.started, up: result.up, error: result.error });
       } catch (error) {
-        sendJson2(res, 200, { ok: false, started: false, up: false, error: error instanceof Error ? error.message : "could not start the dev server" });
+        sendJson3(res, 200, { ok: false, started: false, up: false, error: error instanceof Error ? error.message : "could not start the dev server" });
       }
       return;
     }
     if (url.pathname === "/server/stop") {
       if (req.method !== "POST") {
-        sendJson2(res, 405, { error: "POST required" });
+        sendJson3(res, 405, { error: "POST required" });
         return;
       }
       let parsed;
       try {
-        parsed = JSON.parse(await readBody2(req));
+        parsed = JSON.parse(await readBody3(req));
       } catch {
-        sendJson2(res, 400, { error: "body must be JSON" });
+        sendJson3(res, 400, { error: "body must be JSON" });
         return;
       }
       const dir = parsed?.dir;
       if (typeof dir !== "string" || !path11.isAbsolute(dir)) {
-        sendJson2(res, 400, { error: "dir must be an absolute project path" });
+        sendJson3(res, 400, { error: "dir must be an absolute project path" });
         return;
       }
       try {
         const result = await stopDevServer(dir);
-        sendJson2(
+        sendJson3(
           res,
           200,
           result.error ? { ok: false, stopped: result.stopped, error: result.error } : { ok: true, stopped: result.stopped }
         );
       } catch (error) {
-        sendJson2(res, 200, { ok: false, error: error instanceof Error ? error.message : "could not stop the dev server" });
+        sendJson3(res, 200, { ok: false, error: error instanceof Error ? error.message : "could not stop the dev server" });
       }
       return;
     }
     if (url.pathname === "/server/status") {
       const dir = params.get("dir") ?? "";
       if (!path11.isAbsolute(dir)) {
-        sendJson2(res, 400, { error: "dir must be absolute" });
+        sendJson3(res, 400, { error: "dir must be absolute" });
         return;
       }
       try {
-        sendJson2(res, 200, await getDevServerStatus(dir));
+        sendJson3(res, 200, await getDevServerStatus(dir));
       } catch (error) {
-        sendJson2(res, 200, { up: false, port: null, error: error instanceof Error ? error.message : "could not read server status" });
+        sendJson3(res, 200, { up: false, port: null, error: error instanceof Error ? error.message : "could not read server status" });
       }
       return;
     }
@@ -7433,22 +7908,22 @@ var server = http.createServer(async (req, res) => {
       const root = params.get("dir") ?? "";
       const entry = params.get("path") ?? "";
       if (!path11.isAbsolute(root)) {
-        sendJson2(res, 400, { error: "dir must be absolute" });
+        sendJson3(res, 400, { error: "dir must be absolute" });
         return;
       }
       const abs = await requireFile(root, entry);
       if (!abs) {
-        sendJson2(res, 404, { error: "entry not found" });
+        sendJson3(res, 404, { error: "entry not found" });
         return;
       }
       const dir = path11.dirname(abs);
-      sendJson2(res, 200, { mtime: await newestMtime(dir, abs) });
+      sendJson3(res, 200, { mtime: await newestMtime(dir, abs) });
       return;
     }
     if (url.pathname === "/state") {
       const target = getBrowser();
       if (!target) {
-        sendJson2(res, 200, {
+        sendJson3(res, 200, {
           url: "",
           title: "",
           lastPick: null,
@@ -7461,59 +7936,59 @@ var server = http.createServer(async (req, res) => {
       }
       const state = await target.state();
       state.bridgeActive = bridge.active();
-      sendJson2(res, 200, state);
+      sendJson3(res, 200, state);
       return;
     }
     if (url.pathname === "/bridge") {
       if (req.method !== "POST") {
-        sendJson2(res, 405, { error: "POST required" });
+        sendJson3(res, 405, { error: "POST required" });
         return;
       }
       let parsed;
       try {
-        parsed = JSON.parse(await readBody2(req));
+        parsed = JSON.parse(await readBody3(req));
       } catch {
-        sendJson2(res, 400, { error: "body must be JSON" });
+        sendJson3(res, 400, { error: "body must be JSON" });
         return;
       }
       const body = parsed;
       if (body?.release === true) {
         const released = typeof body.token === "string" ? bridge.release(body.token) : false;
-        sendJson2(res, 200, { ok: released, bridgeActive: bridge.active() });
+        sendJson3(res, 200, { ok: released, bridgeActive: bridge.active() });
         return;
       }
       const result = bridge.claim(typeof body?.token === "string" ? body.token : void 0);
-      sendJson2(res, 200, result);
+      sendJson3(res, 200, result);
       return;
     }
     if (url.pathname === "/open") {
       if (req.method !== "POST") {
-        sendJson2(res, 405, { error: "POST required" });
+        sendJson3(res, 405, { error: "POST required" });
         return;
       }
       let parsed;
       try {
-        parsed = JSON.parse(await readBody2(req));
+        parsed = JSON.parse(await readBody3(req));
       } catch {
-        sendJson2(res, 400, { error: "body must be JSON" });
+        sendJson3(res, 400, { error: "body must be JSON" });
         return;
       }
       const body = parsed;
       const target = body?.url;
       if (typeof target !== "string" || target === "") {
-        sendJson2(res, 400, { error: "url is required" });
+        sendJson3(res, 400, { error: "url is required" });
         return;
       }
       const dir = typeof body?.dir === "string" && body.dir !== "" ? body.dir : null;
       if (dir && !path11.isAbsolute(dir)) {
-        sendJson2(res, 400, { error: "dir must be absolute" });
+        sendJson3(res, 400, { error: "dir must be absolute" });
         return;
       }
       let started = false;
       if (dir || isLoopbackUrl(target)) {
         const dev = await ensureDevServer(target, { dir: dir ?? void 0 });
         if (!dev.up) {
-          sendJson2(res, 200, { ok: false, error: dev.error ?? "the dev server is not available" });
+          sendJson3(res, 200, { ok: false, error: dev.error ?? "the dev server is not available" });
           return;
         }
         started = dev.started;
@@ -7521,15 +7996,15 @@ var server = http.createServer(async (req, res) => {
       try {
         const browser2 = await ensureBrowser(target);
         const nav = await browser2.open(target);
-        sendJson2(res, 200, { ok: true, url: nav.url, title: nav.title, settled: nav.settled, started });
+        sendJson3(res, 200, { ok: true, url: nav.url, title: nav.title, settled: nav.settled, started });
       } catch (error) {
-        sendJson2(res, 200, { ok: false, error: error instanceof Error ? error.message : "open failed" });
+        sendJson3(res, 200, { ok: false, error: error instanceof Error ? error.message : "open failed" });
       }
       return;
     }
     if (url.pathname === "/close") {
       if (req.method !== "POST") {
-        sendJson2(res, 405, { error: "POST required" });
+        sendJson3(res, 405, { error: "POST required" });
         return;
       }
       const browser2 = getBrowser();
@@ -7538,85 +8013,85 @@ var server = http.createServer(async (req, res) => {
         await reapOrphanChrome();
       } catch {
       }
-      sendJson2(res, 200, { ok: true });
+      sendJson3(res, 200, { ok: true });
       return;
     }
     if (url.pathname === "/highlight") {
       if (req.method !== "POST") {
-        sendJson2(res, 405, { error: "POST required" });
+        sendJson3(res, 405, { error: "POST required" });
         return;
       }
       let parsed;
       try {
-        parsed = JSON.parse(await readBody2(req));
+        parsed = JSON.parse(await readBody3(req));
       } catch {
-        sendJson2(res, 400, { error: "body must be JSON" });
+        sendJson3(res, 400, { error: "body must be JSON" });
         return;
       }
       const selector = parsed?.selector;
       if (typeof selector !== "string" || selector === "") {
-        sendJson2(res, 400, { error: "selector is required" });
+        sendJson3(res, 400, { error: "selector is required" });
         return;
       }
       const browser2 = getBrowser();
       if (!browser2) {
-        sendJson2(res, 200, { ok: false, error: "no live window is open" });
+        sendJson3(res, 200, { ok: false, error: "no live window is open" });
         return;
       }
       try {
         const highlighted = await browser2.highlight(selector);
         if (!highlighted) {
-          sendJson2(res, 200, { ok: false, error: "selector did not match any element" });
+          sendJson3(res, 200, { ok: false, error: "selector did not match any element" });
           return;
         }
-        sendJson2(res, 200, { ok: true });
+        sendJson3(res, 200, { ok: true });
       } catch (error) {
-        sendJson2(res, 200, { ok: false, error: error instanceof Error ? error.message : "highlight failed" });
+        sendJson3(res, 200, { ok: false, error: error instanceof Error ? error.message : "highlight failed" });
       }
       return;
     }
     if (url.pathname === "/focus") {
       if (req.method !== "POST") {
-        sendJson2(res, 405, { error: "POST required" });
+        sendJson3(res, 405, { error: "POST required" });
         return;
       }
       const browser2 = getBrowser();
       if (browser2) await browser2.focus();
-      sendJson2(res, 200, { ok: true });
+      sendJson3(res, 200, { ok: true });
       return;
     }
     if (url.pathname === "/config") {
       const root = params.get("dir") ?? "";
       if (!path11.isAbsolute(root)) {
-        sendJson2(res, 400, { error: "dir must be absolute" });
+        sendJson3(res, 400, { error: "dir must be absolute" });
         return;
       }
       if (req.method === "PUT") {
-        const body = await readBody2(req);
+        const body = await readBody3(req);
         let parsed;
         try {
           parsed = JSON.parse(body);
         } catch {
-          sendJson2(res, 400, { error: "body must be JSON" });
+          sendJson3(res, 400, { error: "body must be JSON" });
           return;
         }
         if (typeof parsed.text !== "string") {
-          sendJson2(res, 400, { error: "text is required" });
+          sendJson3(res, 400, { error: "text is required" });
           return;
         }
         try {
-          sendJson2(res, 200, { ...await writeStudioConfig(root, parsed.path ?? null, parsed.text) });
+          sendJson3(res, 200, { ...await writeStudioConfig(root, parsed.path ?? null, parsed.text) });
         } catch (error) {
-          sendJson2(res, 400, { error: error instanceof Error ? error.message : "invalid config" });
+          sendJson3(res, 400, { error: error instanceof Error ? error.message : "invalid config" });
         }
         return;
       }
-      sendJson2(res, 200, { ...await readStudioConfig(root) });
+      sendJson3(res, 200, { ...await readStudioConfig(root) });
       return;
     }
-    sendJson2(res, 404, { error: "not found" });
+    sendJson3(res, 404, { error: "not found" });
   } catch (error) {
-    sendJson2(res, 500, { error: error instanceof Error ? error.message : "internal error" });
+    sendJson3(res, 500, { error: error instanceof Error ? error.message : "internal error" });
   }
 });
 server.listen(PORT, "127.0.0.1", () => {
